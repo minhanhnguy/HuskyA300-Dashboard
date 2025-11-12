@@ -41,16 +41,113 @@ button {
     border-radius: 8px;
     padding: 6px 10px;
     cursor: pointer;
+    font-size: 12px;
 }
 
 button:hover {
     background: #273244;
 }
 
+button.small {
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+}
+
 label {
     user-select: none;
+    font-size: 12px;
+    opacity: 0.85;
 }
 
 input[type="range"] {
     accent-color: #60a5fa;
+}
+
+#timeControls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 10px;
+}
+
+#timeControls input[type="range"] {
+    width: 260px;
+}
+
+.muted {
+    opacity: 0.6;
+    font-size: 11px;
+}
+
+/* Bag panel overlay */
+#bagPanel {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding-top: 80px;
+    z-index: 50;
+}
+
+#bagPanel.hidden {
+    display: none;
+}
+
+#bagPanelInner {
+    background: #0f1720;
+    border: 1px solid #1f2937;
+    border-radius: 10px;
+    width: 360px;
+    max-height: 420px;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.35);
+    padding: 12px 14px 14px;
+}
+
+.bag-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.bag-panel-header h3 {
+    font-size: 14px;
+    margin: 0;
+}
+
+#bagPanelBody {
+    border-top: 1px solid #1f2733;
+    margin-top: 6px;
+    padding-top: 8px;
+}
+
+.bag-list {
+    list-style: none;
+    padding: 0;
+    margin: 4px 0 0;
+}
+
+.bag-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.bag-list li:hover {
+    background: #1f2937;
+}
+
+.bag-list small {
+    opacity: 0.6;
+    font-size: 11px;
 }

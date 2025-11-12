@@ -654,8 +654,8 @@ function draw() {
 
   if (mapLayer) mapLayer.draw(ctx, world2screen, viewport);
 
-  drawGrid(1.0,  '#142235');
-  drawGrid(0.25, '#0e1826');
+  drawGrid(1.0,  'rgba(0, 0, 0, 0.08)'); 
+  drawGrid(0.25, 'rgba(0, 0, 0, 0.035)'); 
 
   if (path.length > 1) {
     ctx.beginPath();

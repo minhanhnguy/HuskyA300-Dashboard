@@ -1,5 +1,3 @@
-# backend/config.py
-
 NAMESPACE = "/a300_0000"
 
 # ---- Integrator / UI ----
@@ -34,27 +32,21 @@ TOPIC_CMD_VEL = RECORD_IN_TOPIC  # back-compat
 # ---- Map topics & cadence ----
 MAP_TOPIC          = f"{NAMESPACE}/map"
 MAP_UPDATES_TOPIC  = f"{NAMESPACE}/map_updates"
-MAP_WS_HZ          = 15.0          # push patches at 15 Hz
-MAP_TILE_SIZE      = 256           # tile in CELLS (for client-side tiling)
+MAP_WS_HZ          = 15.0
+MAP_TILE_SIZE      = 256
 
-# ---- Pose source preferences & frames ----
-# The node will try pose sources in this order:
-#   1) TF (map -> base_link)
-#   2) ODOM (nav_msgs/Odometry topic)
-#   3) INTEGRATED (dead-reckon from cmd_vel)
-POSE_PREF_ORDER = ["tf", "odom", "integrated"]
+# ---- Pose source (live) ----
+# Force odom/filtered only in live mode (no TF, no integration).
+POSE_PREF_ORDER = ["odom"]
+ODOM_CANDIDATES = [f"{NAMESPACE}/platform/odom/filtered"]
+USE_TF_POSE = False  # live
 
-# Add Clearpath A300 platform odom topics explicitly.
-ODOM_CANDIDATES = [
-    f"{NAMESPACE}/platform/odom/filtered",
-    f"{NAMESPACE}/platform/odom",
-    f"{NAMESPACE}/odometry/filtered",
-    f"{NAMESPACE}/odom",
-    f"{NAMESPACE}/wheel/odometry",
-    "odometry/filtered",
-    "odom",
-]
-
-USE_TF_POSE = True
 MAP_FRAME   = "map"
 BASE_FRAME  = f"{NAMESPACE}/base_link"
+
+# ---- Bag-mode options ----
+# If TF exists in the bag, we’ll compose map->odom(t) with odom pose.
+# If TF is missing, we can optionally anchor first odom pose to map origin (translate+rotate).
+BAG_USE_TF = True
+BAG_ANCHOR_ODOM_TO_MAP = True
+BAG_USE_MAP_YAW = True  # set False if your frontend does not rotate tiles

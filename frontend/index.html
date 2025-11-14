@@ -8,7 +8,6 @@
 </head>
 <body>
   <div id="toolbar">
-    <!-- renamed + behavior changed in JS -->
     <button id="liveModeBtn">Go back to Live</button>
     <button id="bagPanelBtn">Bag files playback</button>
     <button id="playBtn" style="display:none">Play</button>
@@ -27,7 +26,6 @@
     <canvas id="view"></canvas>
   </div>
 
-  <!-- Bag selection panel -->
   <div id="bagPanel" class="hidden">
     <div id="bagPanelInner">
       <div class="bag-panel-header">
@@ -41,6 +39,7 @@
     </div>
   </div>
 
-  <script type="module" src="/src/main.js"></script>
+  <!-- TS entry -->
+  <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

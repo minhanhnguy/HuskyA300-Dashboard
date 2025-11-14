@@ -1,8 +1,7 @@
+# backend/app.py
 import asyncio
 import json
 from typing import Any, Dict, List, Optional
-
-import numpy as np  # <<< added
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,10 +11,21 @@ from .state import SharedState
 from .ros_worker import start_ros_in_thread, request_reverse_replay
 from . import config as C
 
+from .models import (
+    PoseHistoryResponse, PoseHistoryMeta,
+    MapFullResponse, MapFullAtResponse, MapDeltaResponse
+)
+from .services.pose_service import (
+    get_pose_history_service, get_pose_history_meta_service
+)
+from .services.map_service import (
+    map_full_at_service, map_delta_service
+)
+
 # Optional bag helpers (graceful fallback if file not present)
 try:
     from .bag_replay import list_bag_files, replay_bag_in_thread
-except Exception as _e:
+except Exception:
     def list_bag_files():
         return []
     def replay_bag_in_thread(*args, **kwargs):
@@ -37,28 +47,23 @@ shared = SharedState()
 
 
 def get_core():
-    """
-    Some refactors store runtime under shared.core; older code used fields on shared directly.
-    This helper returns the active object holding path/pose/map state.
-    """
+    """Return the object holding path/pose/map state (shared.core in your design)."""
     return getattr(shared, "core", shared)
 
 
 # ---------------------- Lifecycle ----------------------
 @app.on_event("startup")
 async def on_startup():
-    # Start ROS2 node in background thread
     start_ros_in_thread(shared)
 
 
 # ---------------------- Helpers ------------------------
 def _snapshot_state() -> Dict[str, Any]:
     core = get_core()
-    # If you introduced a research_core with snapshot_for_ui(), prefer it
     if hasattr(core, "snapshot_for_ui"):
         return core.snapshot_for_ui()
 
-    # Fallback to direct fields
+    # Fallback path (older code paths)
     with core.lock:
         path_pts = list(core.path)
         pose = {"x": core.x, "y": core.y, "yaw": core.yaw}
@@ -71,14 +76,7 @@ def _snapshot_state() -> Dict[str, Any]:
             "pose_hist": len(core.pose_history),
         }
         map_meta = core.map_info
-    return {
-        "path": path_pts,
-        "pose": pose,
-        "v": v,
-        "w": w,
-        "stats": stats,
-        "map_meta": map_meta,
-    }
+    return {"path": path_pts, "pose": pose, "v": v, "w": w, "stats": stats, "map_meta": map_meta}
 
 
 # ---------------------- REST: Core ----------------------
@@ -91,8 +89,11 @@ async def status():
 async def reset():
     core = get_core()
     with core.lock:
-        # Reset only the visual/integrated pose & path — keep histories and map.
-        core.seed(0.0, 0.0, 0.0)
+        core.x = 0.0
+        core.y = 0.0
+        core.yaw = 0.0
+        core.path.clear()
+        core.path.append((0.0, 0.0))
     return {"ok": True}
 
 
@@ -103,25 +104,14 @@ async def reverse_replay():
 
 
 # ---------------------- REST: Pose history --------------
-@app.get("/api/v1/pose_history")
+@app.get("/api/v1/pose_history", response_model=PoseHistoryResponse)
 async def pose_history():
-    core = get_core()
-    with core.lock:
-        ph = [
-            {"t": t, "x": x, "y": y, "yaw": yaw}
-            for (t, x, y, yaw) in core.pose_history
-        ]
-    return {"pose_history": ph}
+    return get_pose_history_service(get_core())
 
 
-@app.get("/api/v1/pose_history_meta")
+@app.get("/api/v1/pose_history_meta", response_model=PoseHistoryMeta)
 async def pose_history_meta():
-    core = get_core()
-    with core.lock:
-        n = len(core.pose_history)
-        t0 = core.pose_history[0][0] if n else 0.0
-        t1 = core.pose_history[-1][0] if n else 0.0
-    return {"count": n, "t0": t0, "t1": t1}
+    return get_pose_history_meta_service(get_core())
 
 
 # ---------------------- REST: Map -----------------------
@@ -133,141 +123,41 @@ async def map_meta():
     return info or {}
 
 
-@app.get("/api/v1/map_full")
+@app.get("/api/v1/map_full", response_model=MapFullResponse)
 async def map_full():
     core = get_core()
     with core.lock:
         g = core.map_grid
         ver = core.map_version
     if g is None:
-        return {"version": ver, "data": []}
-    # raw int8 flattened row-major
-    return {"version": ver, "data": g.flatten(order="C").tolist()}
+        return MapFullResponse(version=int(ver), data=[])
+    return MapFullResponse(version=int(ver), data=g.flatten(order="C").tolist())
 
 
-# Exact map snapshot at time t (for bag playback time-travel)
-@app.get("/api/v1/map_full_at")
+@app.get("/api/v1/map_full_at", response_model=MapFullAtResponse)
 async def map_full_at(t: float = Query(..., description="Absolute bag time (seconds)")):
-    """
-    Returns the map state at exact bag time `t`.
-    - If an index exists but no map exists at/before t, returns {} (not 404).
-    - If no index exists, returns 404.
-    """
     core = get_core()
-    with core.lock:
-        idx = getattr(core, "_bag_map_index", None)
-    if idx is None:
-        return JSONResponse(status_code=404, content={"error": "no bag index available"})
-
-    snap = idx.snapshot_at(t)
-    if not snap:
-        return {}
-
-    meta, grid = snap
-    return {
-        "meta": {
-            "width": meta.width,
-            "height": meta.height,
-            "resolution": meta.resolution,
-            "origin": {"x": meta.origin_x, "y": meta.origin_y, "yaw": meta.origin_yaw},
-            "version": meta.version,
-            "tile_size": int(getattr(C, "MAP_TILE_SIZE", 256)),
-        },
-        "data": grid.flatten(order="C").tolist()
-    }
+    out = map_full_at_service(core, t)
+    if out is None:
+        # Distinguish "no index" vs "no map before t"
+        with core.lock:
+            idx = getattr(core, "_bag_map_index", None)
+        if idx is None:
+            return JSONResponse(status_code=404, content={"error": "no bag index available"})
+        return JSONResponse(status_code=200, content={})
+    return out
 
 
-# ---------- NEW: Map delta between two bag times (for progressive refining in play) ----------
-@app.get("/api/v1/map_delta")
+@app.get("/api/v1/map_delta", response_model=MapDeltaResponse)
 async def map_delta(
     t0: float = Query(..., description="Start time (seconds, inclusive)"),
     t1: float = Query(..., description="End time (seconds, inclusive)"),
 ):
-    """
-    Returns minimal changes between map at t0 and map at t1.
-    If a new full map version appeared in (t0, t1], we ask the client to reset by
-    returning the full map at t1 (so the client replaces all tiles).
-    Otherwise, we return tile-aligned patches for cells that changed.
-
-    Response shapes:
-      - {"reset": { "meta": {...}, "data": [int8...]} }
-      - {"version": <int>, "patches": [ {x,y,w,h,data:[int8...]} , ... ] }
-    """
-    if t1 < t0:
-        t0, t1 = t1, t0
-
     core = get_core()
-    with core.lock:
-        idx = getattr(core, "_bag_map_index", None)
-    if idx is None:
+    out = map_delta_service(core, t0, t1)
+    if out is None:
         return JSONResponse(status_code=404, content={"error": "no bag index available"})
-
-    snap1 = idx.snapshot_at(t1)
-    if not snap1:
-        return {}
-
-    meta1, grid1 = snap1
-    snap0 = idx.snapshot_at(t0)
-
-    def meta_to_dict(m) -> Dict[str, Any]:
-        return {
-            "width": int(m.width),
-            "height": int(m.height),
-            "resolution": float(m.resolution),
-            "origin": {"x": float(m.origin_x), "y": float(m.origin_y), "yaw": float(m.origin_yaw)},
-            "version": int(m.version),
-            "tile_size": int(getattr(C, "MAP_TILE_SIZE", 256)),
-        }
-
-    # If there was no map at t0 OR the version changed between t0 and t1,
-    # instruct the client to reset to the full map at t1 (simplest & exact).
-    if (not snap0) or (snap0[0].version != meta1.version):
-        return {
-            "reset": {
-                "meta": meta_to_dict(meta1),
-                "data": grid1.flatten(order="C").tolist()
-            }
-        }
-
-    meta0, grid0 = snap0
-    if grid0.shape != grid1.shape:
-        # Safety: shapes changed -> reset
-        return {
-            "reset": {
-                "meta": meta_to_dict(meta1),
-                "data": grid1.flatten(order="C").tolist()
-            }
-        }
-
-    # Compute changed cells then return tile-aligned patches for the changed tiles.
-    changed = (grid0 != grid1)
-    if not np.any(changed):
-        return {"version": int(meta1.version), "patches": []}
-
-    H, W = grid1.shape
-    TS = int(getattr(C, "MAP_TILE_SIZE", 256))
-    patches: List[Dict[str, Any]] = []
-
-    # Iterate only tiles that have any change
-    rows = (H + TS - 1) // TS
-    cols = (W + TS - 1) // TS
-    for r in range(rows):
-        y0 = r * TS
-        y1 = min(H, y0 + TS)
-        for c in range(cols):
-            x0 = c * TS
-            x1 = min(W, x0 + TS)
-            if np.any(changed[y0:y1, x0:x1]):
-                sub = grid1[y0:y1, x0:x1]
-                patches.append({
-                    "x": int(x0),
-                    "y": int(y0),
-                    "w": int(x1 - x0),
-                    "h": int(y1 - y0),
-                    "data": sub.flatten(order="C").astype(np.int8).tolist(),
-                })
-
-    return {"version": int(meta1.version), "patches": patches}
+    return out
 
 
 # ---------------------- REST: Bag files -----------------
@@ -280,7 +170,6 @@ async def bag_list():
 async def bag_play(payload: dict):
     """
     Start indexing a chosen bag (1x). Body: {"name": "<file>.mcap"}
-    The indexer populates pose_history, path, and a time-travel map index.
     """
     name = payload.get("name")
     if not name:
@@ -308,10 +197,7 @@ async def debug_health():
 # ---------------------- WS: Path/Pose stream ------------
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
-    """
-    Periodically streams path appends + latest pose.
-    Frontend uses this for live mode rendering.
-    """
+    """Periodically streams path appends + latest pose (unchanged API)."""
     await ws.accept()
     core = get_core()
 
@@ -332,11 +218,8 @@ async def ws_stream(ws: WebSocket):
             await asyncio.sleep(period)
             with core.lock:
                 n = len(core.path)
-                if n > last_idx:
-                    append = list(core.path)[last_idx:n]
-                    last_idx = n
-                else:
-                    append = []
+                append = list(core.path)[last_idx:n] if n > last_idx else []
+                last_idx = max(last_idx, n)
                 pose = {"x": core.x, "y": core.y, "yaw": core.yaw}
             await ws.send_text(json.dumps({"type": "append", "append": append, "pose": pose}))
     except WebSocketDisconnect:
@@ -346,11 +229,51 @@ async def ws_stream(ws: WebSocket):
 # ---------------------- WS: Map stream ------------------
 @app.websocket("/ws/map")
 async def ws_map(ws: WebSocket):
-    """
-    Sends map meta/full on connect, then streams patches at ~MAP_WS_HZ.
-    Version bump => resend full map + meta.
-    """
+    """Live map stream (unchanged API)."""
     await ws.accept()
     core = get_core()
     last_sent_version = -1
-    period = 1.0 / C.M
+    period = 1.0 / C.MAP_WS_HZ
+
+    # On connect: send meta + full
+    with core.lock:
+        info = core.map_info
+        grid = core.map_grid
+    if info:
+        await ws.send_text(json.dumps({"type": "map_meta", "meta": info}))
+        if grid is not None:
+            await ws.send_text(json.dumps({
+                "type": "map_full",
+                "version": info["version"],
+                "data": grid.flatten(order="C").tolist(),
+            }))
+            last_sent_version = info["version"]
+
+    try:
+        while True:
+            await asyncio.sleep(period)
+            updates: List[Dict[str, Any]] = []
+
+            with core.lock:
+                # Version bump => send fresh full map + meta
+                if core.map_info and core.map_info["version"] != last_sent_version:
+                    info = core.map_info
+                    grid = core.map_grid
+                    await ws.send_text(json.dumps({"type": "map_meta", "meta": info}))
+                    if grid is not None:
+                        await ws.send_text(json.dumps({
+                            "type": "map_full",
+                            "version": info["version"],
+                            "data": grid.flatten(order="C").tolist(),
+                        }))
+                        last_sent_version = info["version"]
+                    core.map_patch_queue.clear()
+                    continue
+
+                while core.map_patch_queue:
+                    updates.append(core.map_patch_queue.popleft())
+
+            if updates:
+                await ws.send_text(json.dumps({"type": "map_updates", "updates": updates}))
+    except WebSocketDisconnect:
+        return

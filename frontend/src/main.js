@@ -5,6 +5,7 @@ import * as d3 from 'd3';
  * - Live mode: timeline grows; slider can follow live or scrub.
  * - Bag mode: timeline frozen to bag duration; play/pause + scrub.
  * - Map “time-travel”: in bag mode fetch exact map at slider time.
+ * - NEW: During play, apply map *patches* between frames for progressive refining.
  */
 
 // ==============================
@@ -54,7 +55,11 @@ let liveMode  = true;      // auto-follow end in live mode (ignored in bag mode)
 let isPlaying  = false;    // bag playback
 let playRate   = 1.0;      // 1×
 let lastTickTs = null;
-let mapPlayTimer = null;   // coarse map refresh timer (bag playback)
+
+// NEW: progressive refine timer & state
+let mapPlayTimer = null;               // now drives PATCH requests at ~25Hz
+let lastAbsTForDelta = null;
+let deltaBusy = false;
 
 let path = [];                       // [[x,y], ...]
 let pose = { x: 0, y: 0, yaw: 0 };   // live pose
@@ -185,7 +190,7 @@ class MapTiles {
         cnv.width = tw; cnv.height = th;
         const tctx = cnv.getContext('2d');
         tctx.imageSmoothingEnabled = false;
-        this.tiles[r][c] = { canvas: cnv, ctx: tctx, dirty: true, tw, th };
+        this.tiles[r][c] = { canvas: cnv, ctx: tctx, dirty: true, tw, th, flashUntil: 0 };
       }
     }
   }
@@ -229,6 +234,7 @@ class MapTiles {
     const c1 = Math.min(this.cols - 1, Math.floor((xMax - 1) / this.tileSize));
     const r0 = Math.max(0, Math.floor(yMin / this.tileSize));
     const r1 = Math.min(this.rows - 1, Math.floor((yMax - 1) / this.tileSize));
+    const now = performance.now();
     for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
       const t = this.tiles[r][c];
       if (t.dirty) this._rebuildTile(r, c);
@@ -247,6 +253,16 @@ class MapTiles {
       ctx.scale(Math.abs(sx), Math.abs(sy));
       const dx = sx < 0 ? -t.tw : 0, dy = sy < 0 ? -t.th : 0;
       ctx.drawImage(t.canvas, dx, dy);
+
+      // light flash overlay on freshly-updated tiles (120ms)
+      if (t.flashUntil > now) {
+        const alpha = Math.min(0.15, (t.flashUntil - now) / 120 * 0.15);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#60a5fa';
+        ctx.fillRect(dx, dy, t.tw, t.th);
+        ctx.globalAlpha = 1;
+      }
+
       ctx.restore();
     }
   }
@@ -274,10 +290,8 @@ function connectMapWS() {
       setStatus(`Map v${meta.version} loaded`);
     } else if (msg.type === 'map_updates') {
       if (!mapLayer) return;
-      // We keep bag-mode exactness separate; live mode just applies patches here
       for (const up of msg.updates) {
         const { x, y, w, h, data } = up;
-        // A fast in-place patch: mark dirty tiles; rebuild on draw()
         const c0 = Math.floor(x / mapLayer.tileSize), c1 = Math.floor((x + w - 1) / mapLayer.tileSize);
         const r0 = Math.floor(y / mapLayer.tileSize), r1 = Math.floor((y + h - 1) / mapLayer.tileSize);
         for (let yy = 0; yy < h; yy++) {
@@ -285,10 +299,13 @@ function connectMapWS() {
           const dstOff = (y + yy) * mapLayer.w + x;
           mapLayer.data.set(Int8Array.from(data.slice(srcOff, srcOff + w)), dstOff);
         }
+        const now = performance.now();
         for (let r = r0; r <= r1; r++)
           for (let c = c0; c <= c1; c++)
-            if (r >= 0 && r < mapLayer.rows && c >= 0 && c < mapLayer.cols)
+            if (r >= 0 && r < mapLayer.rows && c >= 0 && c < mapLayer.cols) {
               mapLayer.tiles[r][c].dirty = true;
+              mapLayer.tiles[r][c].flashUntil = now + 120;
+            }
       }
     }
   };
@@ -309,7 +326,6 @@ async function fetchMapAtRel(rel) {
     const meta = j.meta;
     const version = meta.version ?? 0;
 
-    // meta/version change => rebuild tiles
     const needsRebuild = (
       !mapLayer ||
       version !== currentMapVersion ||
@@ -326,6 +342,63 @@ async function fetchMapAtRel(rel) {
     mapLayer.loadFull(Int8Array.from(j.data));
   } finally {
     isMapLoading = false;
+  }
+}
+
+// NEW: Map patches between two absolute times
+async function fetchMapDeltaBetween(absT0, absT1) {
+  if (!isBagMode || t0 == null) return;
+  if (!mapLayer) {
+    // If we somehow don't have a base, load full at target then return
+    const rel = absT1 - t0;
+    await fetchMapAtRel(rel);
+    return;
+  }
+  if (deltaBusy) return;
+  deltaBusy = true;
+  try {
+    const url = `/api/v1/map_delta?t0=${encodeURIComponent(absT0.toFixed(3))}&t1=${encodeURIComponent(absT1.toFixed(3))}`;
+    const j = await fetch(url).then(r => r.json());
+    if (!j) return;
+
+    if (j.reset) {
+      const meta = j.reset.meta;
+      mapLayer = new MapTiles(meta);
+      currentMapVersion = meta.version ?? 0;
+      mapLayer.loadFull(Int8Array.from(j.reset.data));
+      return;
+    }
+
+    if (typeof j.version === 'number' && j.version !== currentMapVersion) {
+      // Safety: version drift; pull full at t1
+      await fetchMapAtRel(absT1 - t0);
+      currentMapVersion = j.version;
+      return;
+    }
+
+    const updates = j.patches || [];
+    if (!updates.length) return;
+    for (const up of updates) {
+      const { x, y, w, h, data } = up;
+      const c0 = Math.floor(x / mapLayer.tileSize), c1 = Math.floor((x + w - 1) / mapLayer.tileSize);
+      const r0 = Math.floor(y / mapLayer.tileSize), r1 = Math.floor((y + h - 1) / mapLayer.tileSize);
+      for (let yy = 0; yy < h; yy++) {
+        const srcOff = yy * w;
+        const dstOff = (y + yy) * mapLayer.w + x;
+        mapLayer.data.set(Int8Array.from(data.slice(srcOff, srcOff + w)), dstOff);
+      }
+      const now = performance.now();
+      for (let r = r0; r <= r1; r++)
+        for (let c = c0; c <= c1; c++)
+          if (r >= 0 && r < mapLayer.rows && c >= 0 && c < mapLayer.cols) {
+            mapLayer.tiles[r][c].dirty = true;
+            mapLayer.tiles[r][c].flashUntil = now + 120;
+          }
+    }
+  } catch {
+    // ignore network errors in the play loop
+  } finally {
+    deltaBusy = false;
   }
 }
 
@@ -400,25 +473,38 @@ async function startBagReplay(name) {
   setTimelineFromPoseHist();
   setTimelineToEnd();
 
-  // Fetch exact map at end
+  // Fetch exact map at end and prime delta state
   const dur = getDuration();
   await fetchMapAtRel(dur);
+  lastAbsTForDelta = t0 + dur;
 }
 
 // ==============================
-// Play/Pause (bag) — coarse map refresh (~5 Hz)
+// Play/Pause (bag) — progressive refine at ~25Hz
 // ==============================
 function startPlayback() {
   if (!isBagMode || isPlaying) return;
   isPlaying = true;
   lastTickTs = null;
   if (playBtn) playBtn.textContent = 'Pause';
+
+  // Prime lastAbsT for delta
+  const relNow = Number(slider.value) || 0;
+  lastAbsTForDelta = t0 + relNow;
+
+  // Drive delta requests at ~UI rate (25Hz)
   if (!mapPlayTimer) {
     mapPlayTimer = setInterval(async () => {
+      if (!isPlaying || !isBagMode || t0 == null) return;
       const rel = Number(slider.value) || 0;
-      await fetchMapAtRel(rel);
-    }, 200);
+      const targetAbs = t0 + rel;
+      if (targetAbs > (lastAbsTForDelta ?? targetAbs) + 1e-4) {
+        await fetchMapDeltaBetween(lastAbsTForDelta, targetAbs);
+        lastAbsTForDelta = targetAbs;
+      }
+    }, 1000 / 25);
   }
+
   requestAnimationFrame(playTick);
 }
 
@@ -526,7 +612,7 @@ setInterval(async () => {
 // ==============================
 // Slider interactions
 //  - input: scrub pose immediately (map waits)
-//  - change: lazy-load exact map at that time in bag mode
+//  - change: lazy-load exact map at that time in bag mode and reset delta base
 // ==============================
 slider.addEventListener('input', () => {
   if (!poseHist.length || t0 == null) return;
@@ -543,6 +629,7 @@ slider.addEventListener('change', async () => {
   if (!isBagMode) return; // live mode uses WS/REST live map
   const rel = Number(slider.value);
   await fetchMapAtRel(rel);
+  lastAbsTForDelta = t0 + rel; // resync delta base to playhead
 });
 
 // Jump-to-live (ignored in bag mode)

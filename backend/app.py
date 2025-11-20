@@ -1,4 +1,3 @@
-# backend/app.py
 import asyncio
 import json
 from typing import Any, Dict, List, Optional
@@ -12,24 +11,34 @@ from .ros_worker import start_ros_in_thread, request_reverse_replay
 from . import config as C
 
 from .models import (
-    PoseHistoryResponse, PoseHistoryMeta,
-    MapFullResponse, MapFullAtResponse, MapDeltaResponse
+    PoseHistoryResponse,
+    PoseHistoryMeta,
+    MapFullResponse,
+    MapFullAtResponse,
+    MapDeltaResponse,
+    ScanAtResponse,
 )
 from .services.pose_service import (
-    get_pose_history_service, get_pose_history_meta_service
+    get_pose_history_service,
+    get_pose_history_meta_service,
 )
 from .services.map_service import (
-    map_full_at_service, map_delta_service
+    map_full_at_service,
+    map_delta_service,
 )
+from .services.scan_service import get_scan_at_service
 
 # Optional bag helpers (graceful fallback if file not present)
 try:
     from .bag_replay import list_bag_files, replay_bag_in_thread
 except Exception:
+
     def list_bag_files():
         return []
+
     def replay_bag_in_thread(*args, **kwargs):
         raise FileNotFoundError("bag_replay.py not available")
+
 
 app = FastAPI(title="Husky Dashboard")
 
@@ -76,7 +85,14 @@ def _snapshot_state() -> Dict[str, Any]:
             "pose_hist": len(core.pose_history),
         }
         map_meta = core.map_info
-    return {"path": path_pts, "pose": pose, "v": v, "w": w, "stats": stats, "map_meta": map_meta}
+    return {
+        "path": path_pts,
+        "pose": pose,
+        "v": v,
+        "w": w,
+        "stats": stats,
+        "map_meta": map_meta,
+    }
 
 
 # ---------------------- REST: Core ----------------------
@@ -143,7 +159,9 @@ async def map_full_at(t: float = Query(..., description="Absolute bag time (seco
         with core.lock:
             idx = getattr(core, "_bag_map_index", None)
         if idx is None:
-            return JSONResponse(status_code=404, content={"error": "no bag index available"})
+            return JSONResponse(
+                status_code=404, content={"error": "no bag index available"}
+            )
         return JSONResponse(status_code=200, content={})
     return out
 
@@ -156,8 +174,31 @@ async def map_delta(
     core = get_core()
     out = map_delta_service(core, t0, t1)
     if out is None:
-        return JSONResponse(status_code=404, content={"error": "no bag index available"})
+        return JSONResponse(
+            status_code=404, content={"error": "no bag index available"}
+        )
     return out
+
+
+# ---------------------- REST: Lidar scan (bag mode) -----
+@app.get("/api/v1/scan_at", response_model=ScanAtResponse)
+async def scan_at(
+    t: float = Query(..., description="Absolute bag time (seconds)"),
+    decim: int = Query(
+        1, ge=1, description="Decimation factor over beam index (1 = all beams)"
+    ),
+    max_points: int = Query(
+        12000, ge=1, description="Max number of points to return"
+    ),
+    tol: float = Query(
+        0.05, ge=0.0, description="Time tolerance in seconds for nearest scan"
+    ),
+):
+    """
+    Return lidar scan points in MAP frame nearest to time t (bag mode).
+    """
+    core = get_core()
+    return get_scan_at_service(core, t=t, decim=decim, max_points=max_points, tol=tol)
 
 
 # ---------------------- REST: Bag files -----------------
@@ -173,11 +214,15 @@ async def bag_play(payload: dict):
     """
     name = payload.get("name")
     if not name:
-        return JSONResponse(status_code=400, content={"error": "name is required"})
+        return JSONResponse(
+            status_code=400, content={"error": "name is required"}
+        )
     try:
         replay_bag_in_thread(shared, name, speed=1.0)
     except FileNotFoundError:
-        return JSONResponse(status_code=404, content={"error": "bag not found"})
+        return JSONResponse(
+            status_code=404, content={"error": "bag not found"}
+        )
     return {"ok": True}
 
 
@@ -189,7 +234,8 @@ async def debug_health():
         return {
             "pose_history_count": len(core.pose_history),
             "path_len": len(core.path),
-            "has_bag_index": hasattr(core, "_bag_map_index") and (core._bag_map_index is not None),
+            "has_bag_index": hasattr(core, "_bag_map_index")
+            and (core._bag_map_index is not None),
             "map_info": core.map_info,
         }
 
@@ -203,13 +249,17 @@ async def ws_stream(ws: WebSocket):
 
     # Initial snapshot
     snap = _snapshot_state()
-    await ws.send_text(json.dumps({
-        "type": "snapshot",
-        "path": snap.get("path", []),
-        "pose": snap.get("pose", {"x": 0, "y": 0, "yaw": 0}),
-        "v":    snap.get("v", 0.0),
-        "w":    snap.get("w", 0.0),
-    }))
+    await ws.send_text(
+        json.dumps(
+            {
+                "type": "snapshot",
+                "path": snap.get("path", []),
+                "pose": snap.get("pose", {"x": 0, "y": 0, "yaw": 0}),
+                "v": snap.get("v", 0.0),
+                "w": snap.get("w", 0.0),
+            }
+        )
+    )
     last_idx = len(snap.get("path", []))
     period = 1.0 / C.UI_HZ
 
@@ -221,7 +271,9 @@ async def ws_stream(ws: WebSocket):
                 append = list(core.path)[last_idx:n] if n > last_idx else []
                 last_idx = max(last_idx, n)
                 pose = {"x": core.x, "y": core.y, "yaw": core.yaw}
-            await ws.send_text(json.dumps({"type": "append", "append": append, "pose": pose}))
+            await ws.send_text(
+                json.dumps({"type": "append", "append": append, "pose": pose})
+            )
     except WebSocketDisconnect:
         return
 
@@ -242,11 +294,15 @@ async def ws_map(ws: WebSocket):
     if info:
         await ws.send_text(json.dumps({"type": "map_meta", "meta": info}))
         if grid is not None:
-            await ws.send_text(json.dumps({
-                "type": "map_full",
-                "version": info["version"],
-                "data": grid.flatten(order="C").tolist(),
-            }))
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "map_full",
+                        "version": info["version"],
+                        "data": grid.flatten(order="C").tolist(),
+                    }
+                )
+            )
             last_sent_version = info["version"]
 
     try:
@@ -259,13 +315,19 @@ async def ws_map(ws: WebSocket):
                 if core.map_info and core.map_info["version"] != last_sent_version:
                     info = core.map_info
                     grid = core.map_grid
-                    await ws.send_text(json.dumps({"type": "map_meta", "meta": info}))
+                    await ws.send_text(
+                        json.dumps({"type": "map_meta", "meta": info})
+                    )
                     if grid is not None:
-                        await ws.send_text(json.dumps({
-                            "type": "map_full",
-                            "version": info["version"],
-                            "data": grid.flatten(order="C").tolist(),
-                        }))
+                        await ws.send_text(
+                            json.dumps(
+                                {
+                                    "type": "map_full",
+                                    "version": info["version"],
+                                    "data": grid.flatten(order="C").tolist(),
+                                }
+                            )
+                        )
                         last_sent_version = info["version"]
                     core.map_patch_queue.clear()
                     continue
@@ -274,6 +336,8 @@ async def ws_map(ws: WebSocket):
                     updates.append(core.map_patch_queue.popleft())
 
             if updates:
-                await ws.send_text(json.dumps({"type": "map_updates", "updates": updates}))
+                await ws.send_text(
+                    json.dumps({"type": "map_updates", "updates": updates})
+                )
     except WebSocketDisconnect:
         return

@@ -30,3 +30,11 @@ export type MapWSMessage =
   | { type: "map_meta"; meta: MapMeta }
   | { type: "map_full"; version: number; data: number[] }
   | { type: "map_updates"; updates: { x:number;y:number;w:number;h:number;data:number[] }[] };
+
+// Lidar scan (bag mode)
+export interface ScanAtResponse {
+  t: number;        // actual scan time used (bag time, seconds)
+  frame: string;    // original frame_id
+  count: number;    // number of (x,y) points
+  points: number[]; // flattened [x0, y0, x1, y1, ...] in MAP frame (meters)
+}

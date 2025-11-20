@@ -8,6 +8,7 @@ import {
   PoseHistoryResponse,
   PathWSMessage,
   MapWSMessage,
+  ScanAtResponse,
 } from "./types";
 
 /**
@@ -109,6 +110,11 @@ let scrubPose: { x: number; y: number; yaw: number } | null = null;
 let mapLayer: MapTiles | null = null;
 let currentMapVersion = -999;
 let isMapLoading = false; // draw shimmer overlay while fetching
+
+// Lidar scan layer (bag mode)
+let scanPoints: Float32Array | null = null;
+let lastScanReqAbsT: number | null = null;
+let scanReqInFlight = false;
 
 // ==============================
 // Helpers
@@ -523,6 +529,38 @@ async function fetchMapDeltaBetween(absT0: number, absT1: number): Promise<void>
 }
 
 // ==============================
+// Lidar scan fetch (bag mode)
+// ==============================
+function requestScanAtAbs(absT: number): void {
+  if (!isBagMode || t0 == null) return;
+  if (scanReqInFlight) return;
+  if (lastScanReqAbsT != null && Math.abs(absT - lastScanReqAbsT) < 0.03) return; // throttle
+
+  scanReqInFlight = true;
+  lastScanReqAbsT = absT;
+
+  (async () => {
+    try {
+      const url = `/api/v1/scan_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        return;
+      }
+      const j = (await r.json()) as ScanAtResponse;
+      if (!j || !Array.isArray(j.points) || j.count <= 0) {
+        scanPoints = null;
+        return;
+      }
+      scanPoints = new Float32Array(j.points);
+    } catch {
+      // ignore network errors; keep last scan
+    } finally {
+      scanReqInFlight = false;
+    }
+  })();
+}
+
+// ==============================
 // Bag panel
 // ==============================
 async function loadBagListIntoPanel(): Promise<void> {
@@ -596,6 +634,10 @@ async function startBagReplay(name: string): Promise<void> {
   if (playBtn) playBtn.style.display = "";
 
   path = [];
+  scanPoints = null;
+  lastScanReqAbsT = null;
+  scanReqInFlight = false;
+
   setStatus(`Replaying bag: ${name}`);
   closeBagPanel();
 
@@ -608,6 +650,9 @@ async function startBagReplay(name: string): Promise<void> {
   const dur = getDuration();
   await fetchMapAtRel(dur);
   lastAbsTForDelta = (t0 ?? 0) + dur;
+  if (t0 != null) {
+    requestScanAtAbs(t0 + dur);
+  }
 }
 
 // ==============================
@@ -633,6 +678,7 @@ function startPlayback(): void {
         await fetchMapDeltaBetween(lastAbsTForDelta!, targetAbs);
         lastAbsTForDelta = targetAbs;
       }
+      requestScanAtAbs(targetAbs);
     }, 1000 / 25);
   }
 
@@ -700,6 +746,10 @@ liveModeBtn.onclick = async () => {
 
   if (liveBtn) liveBtn.style.display = "";
   if (playBtn) playBtn.style.display = "none";
+
+  scanPoints = null;
+  lastScanReqAbsT = null;
+  scanReqInFlight = false;
 
   await loadPoseHistoryOnce();
   setTimelineFromPoseHist();
@@ -780,6 +830,9 @@ slider!.addEventListener("input", () => {
   updateTimeUI(rel);
   scrubTime = t0 + rel;
   scrubPose = poseAt(scrubTime);
+  if (isBagMode && scrubTime != null) {
+    requestScanAtAbs(scrubTime);
+  }
 });
 
 slider!.addEventListener("change", async () => {
@@ -788,6 +841,7 @@ slider!.addEventListener("change", async () => {
   const rel = Number(slider!.value);
   await fetchMapAtRel(rel);
   lastAbsTForDelta = t0 + rel; // resync delta base to playhead
+  requestScanAtAbs(t0 + rel);
 });
 
 // Jump-to-live (ignored in bag mode)
@@ -836,7 +890,7 @@ function world2screen(x: number, y: number): [number, number] {
 
 function drawRobot(xm: number, ym: number, yaw: number, color = "#f59e0b"): void {
   const [x, y] = world2screen(xm, ym);
-  const size = Math.max(8, 12 * (zoomTransform.k / 40));
+  const size = Math.max(8, 12 * (zoomTransform.k / 40) * 1.6);
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(-yaw);
@@ -890,6 +944,27 @@ function drawGrid(stepMeters: number, color: string): void {
   ctx.restore();
 }
 
+function drawLidar(): void {
+  if (!scanPoints || scanPoints.length < 2) return;
+
+  const baseRadius = 1.5 * (zoomTransform.k / 40);
+  const radius = Math.max(1, baseRadius);
+
+  ctx.save();
+  ctx.fillStyle = "#ef4444"; // uniform red, similar to RViz
+
+  for (let i = 0; i < scanPoints.length; i += 2) {
+    const xm = scanPoints[i];
+    const ym = scanPoints[i + 1];
+    const [X, Y] = world2screen(xm, ym);
+    ctx.beginPath();
+    ctx.arc(X, Y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
 function draw(): void {
   ctx.save();
   ctx.clearRect(0, 0, W, H);
@@ -910,6 +985,9 @@ function draw(): void {
   drawGrid(1.0, "rgba(0, 0, 0, 0.08)");
   drawGrid(0.25, "rgba(0, 0, 0, 0.035)");
 
+  // Lidar scan (on top of map/grid)
+  drawLidar();
+
   if (path.length > 1) {
     ctx.beginPath();
     for (let i = 0; i < path.length; i++) {
@@ -917,7 +995,7 @@ function draw(): void {
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 1;
     ctx.strokeStyle = "#60a5fa";
     ctx.stroke();
   }

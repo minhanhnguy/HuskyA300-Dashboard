@@ -1,3 +1,4 @@
+# backend/app.py
 import asyncio
 import json
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,7 @@ from .models import (
     MapFullAtResponse,
     MapDeltaResponse,
     ScanAtResponse,
+    CmdStatsResponse,
 )
 from .services.pose_service import (
     get_pose_history_service,
@@ -27,6 +29,11 @@ from .services.map_service import (
     map_delta_service,
 )
 from .services.scan_service import get_scan_at_service
+from .services.cmd_service import get_cmd_stats_at_service
+from .services.costmap_service import (
+    global_costmap_full_at_service,
+    local_costmap_full_at_service,
+)
 
 # Optional bag helpers (graceful fallback if file not present)
 try:
@@ -180,6 +187,25 @@ async def map_delta(
     return out
 
 
+# ---------------------- REST: Costmaps ------------------
+@app.get("/api/v1/costmap/global/full_at", response_model=MapFullAtResponse)
+async def costmap_global_full_at(t: float = Query(..., description="Absolute bag time")):
+    core = get_core()
+    out = global_costmap_full_at_service(core, t)
+    if out is None:
+        return JSONResponse(status_code=404, content={"error": "no data"})
+    return out
+
+
+@app.get("/api/v1/costmap/local/full_at", response_model=MapFullAtResponse)
+async def costmap_local_full_at(t: float = Query(..., description="Absolute bag time")):
+    core = get_core()
+    out = local_costmap_full_at_service(core, t)
+    if out is None:
+        return JSONResponse(status_code=404, content={"error": "no data"})
+    return out
+
+
 # ---------------------- REST: Lidar scan (bag mode) -----
 @app.get("/api/v1/scan_at", response_model=ScanAtResponse)
 async def scan_at(
@@ -199,6 +225,15 @@ async def scan_at(
     """
     core = get_core()
     return get_scan_at_service(core, t=t, decim=decim, max_points=max_points, tol=tol)
+
+
+# ---------------------- REST: cmd_vel stats (bag mode) --
+@app.get("/api/v1/cmd_stats_at", response_model=CmdStatsResponse)
+async def cmd_stats_at(
+    t: float = Query(..., description="Absolute bag time (seconds)"),
+):
+    core = get_core()
+    return get_cmd_stats_at_service(core, t)
 
 
 # ---------------------- REST: Bag files -----------------

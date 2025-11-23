@@ -1,3 +1,4 @@
+# backend/bag_replay.py
 import os
 import threading
 from dataclasses import dataclass
@@ -165,7 +166,7 @@ class _StampedSE2:
 
 def _se2_compose(a: _StampedSE2, b: _StampedSE2) -> _StampedSE2:
     """
-    Return A ∘ B (apply B in A's frame): T(x) = R_a * (R_b * x + t_b) + t_b
+    Return A ∘ B (apply B in A's frame): T(x) = R_a * (R_b * x + t_b) + t_a
     Here we only need translation + yaw composition for 2D.
     """
     ca, sa = math.cos(a.yaw), math.sin(a.yaw)
@@ -258,6 +259,133 @@ class _ScanIndex:
         return None
 
 
+# ----------------- Cmd_vel timeline helpers -----------------
+
+
+class _BagCmdIndex:
+    """
+    Time-indexed cmd_vel (Twist/TwistStamped) list with prefix maxima for basic stats.
+    """
+
+    def __init__(self):
+        # raw samples before sorting
+        self._samples: List[Tuple[float, float, float, float, float, float, float]] = []
+
+        # sorted arrays
+        self.times: List[float] = []
+        self.vx: List[float] = []
+        self.vy: List[float] = []
+        self.vz: List[float] = []
+        self.wx: List[float] = []
+        self.wy: List[float] = []
+        self.wz: List[float] = []
+
+        # prefix aggregates
+        self.max_vx_forward_prefix: List[float] = []
+        self.max_vx_reverse_prefix: List[float] = []
+        self.max_wz_abs_prefix: List[float] = []
+        self.has_lateral_prefix: List[bool] = []
+        self.has_ang_xy_prefix: List[bool] = []
+
+        # overall cmd_vel span in bag time
+        self.bag_t0: Optional[float] = None
+        self.bag_t1: Optional[float] = None
+
+    def add(
+        self,
+        t: float,
+        vx: float,
+        vy: float,
+        vz: float,
+        wx: float,
+        wy: float,
+        wz: float,
+    ):
+        self._samples.append((t, vx, vy, vz, wx, wy, wz))
+
+    def finalize(self):
+        if not self._samples:
+            return
+        # sort by time
+        self._samples.sort(key=lambda s: s[0])
+        n = len(self._samples)
+
+        self.times = [0.0] * n
+        self.vx = [0.0] * n
+        self.vy = [0.0] * n
+        self.vz = [0.0] * n
+        self.wx = [0.0] * n
+        self.wy = [0.0] * n
+        self.wz = [0.0] * n
+
+        self.max_vx_forward_prefix = [0.0] * n
+        self.max_vx_reverse_prefix = [0.0] * n
+        self.max_wz_abs_prefix = [0.0] * n
+        self.has_lateral_prefix = [False] * n
+        self.has_ang_xy_prefix = [False] * n
+
+        max_fwd = 0.0
+        max_rev = 0.0  # most negative vx observed (reverse)
+        max_wz_abs = 0.0
+        has_lat = False
+        has_ang_xy = False
+        EPS = 1e-6
+
+        for i, (t, vx, vy, vz, wx, wy, wz) in enumerate(self._samples):
+            self.times[i] = t
+            self.vx[i] = vx
+            self.vy[i] = vy
+            self.vz[i] = vz
+            self.wx[i] = wx
+            self.wy[i] = wy
+            self.wz[i] = wz
+
+            if vx > max_fwd:
+                max_fwd = vx
+            if vx < max_rev:
+                max_rev = vx
+            wz_abs = abs(wz)
+            if wz_abs > max_wz_abs:
+                max_wz_abs = wz_abs
+            if abs(vy) > EPS or abs(vz) > EPS:
+                has_lat = True
+            if abs(wx) > EPS or abs(wy) > EPS:
+                has_ang_xy = True
+
+            self.max_vx_forward_prefix[i] = max_fwd
+            self.max_vx_reverse_prefix[i] = max_rev
+            self.max_wz_abs_prefix[i] = max_wz_abs
+            self.has_lateral_prefix[i] = has_lat
+            self.has_ang_xy_prefix[i] = has_ang_xy
+
+        self.bag_t0 = self.times[0]
+        self.bag_t1 = self.times[-1]
+        # drop the raw list to save memory
+        self._samples = []
+
+    def instant_index_at(self, t: float) -> Optional[int]:
+        """
+        Return index of the last cmd sample at or before time t, or None if none.
+        """
+        times = self.times
+        n = len(times)
+        if n == 0:
+            return None
+        if t < times[0]:
+            return None
+        if t >= times[-1]:
+            return n - 1
+        lo, hi = 0, n - 1
+        # binary search: last index with times[i] <= t
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if times[mid] <= t:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+
 # ----------------- public API -----------------
 
 
@@ -284,6 +412,8 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
       - core._bag_map_index (for /api/v1/map_full_at)
       - core.map_info, core.map_grid, core.map_version (final snapshot)
       - core._bag_scan_index, core._bag_tf_pairs, core._bag_names (for /api/v1/scan_at)
+      - core._bag_cmd_index (for /api/v1/cmd_stats_at)
+      - core.bag_cmd_* prefix arrays (legacy/compatibility)
     """
     path = os.path.join(BAG_DIR, name)
     if not os.path.exists(path):
@@ -311,14 +441,18 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             tf_exact = f"{ns}/tf"
             tfstat_exact = f"{ns}/tf_static"
             scan_exact = f"{ns}/sensors/lidar2d_0/scan"
+            gc_exact = f"{ns}/global_costmap/costmap"
+            lc_exact = f"{ns}/local_costmap/costmap"
 
             # Msg types
             Odom = get_message("nav_msgs/msg/Odometry")
             OccGrid = get_message("nav_msgs/msg/OccupancyGrid")
             OccUp = get_message("map_msgs/msg/OccupancyGridUpdate")
             TFMsg = get_message("tf2_msgs/msg/TFMessage")
-            PoseSt = get_message("geometry_msgs/msg/PoseStamped")  # rarely used fallback
+            PoseSt = get_message("geometry_msgs/msg/PoseStamped")
             Laser = get_message("sensor_msgs/msg/LaserScan")
+            Twist = get_message("geometry_msgs/msg/Twist")
+            TwistStamped = get_message("geometry_msgs/msg/TwistStamped")
 
             # Resolve topics
             def pick_exact_or_any(exact_name: str, type_suffix: str) -> Optional[str]:
@@ -338,7 +472,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 else None
             )
             if odom_topic is None:
-                # No generic fallback for odom unless you want it:
+                # Generic fallback for odom
                 for tname, ttype in topics.items():
                     if ttype.endswith("nav_msgs/msg/Odometry"):
                         odom_topic = tname
@@ -359,6 +493,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 if ttype.endswith("tf2_msgs/msg/TFMessage") and tname not in tf_topics:
                     tf_topics.append(tname)
 
+            # Pose topic (fallback if no odom)
             pose_topic: Optional[str] = None
             pose_exact = f"{ns}/pose"
             if (
@@ -381,13 +516,41 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         scan_topic = tname
                         break
 
+            # Costmap topics
+            gc_topic = pick_exact_or_any(gc_exact, "nav_msgs/msg/OccupancyGrid")
+            lc_topic = pick_exact_or_any(lc_exact, "nav_msgs/msg/OccupancyGrid")
+
+            # Cmd_vel topics (Twist or TwistStamped)
+            cmd_topics: List[str] = []
+            for tname, ttype in topics.items():
+                if (
+                    ttype.endswith("geometry_msgs/msg/Twist")
+                    or ttype.endswith("geometry_msgs/msg/TwistStamped")
+                ):
+                    cmd_topics.append(tname)
+
+            # Prefer names that look like cmd_vel in this namespace
+            preferred_cmds: List[str] = []
+            for tname in cmd_topics:
+                if (
+                    tname == f"{ns}/cmd_vel"
+                    or tname == "/cmd_vel"
+                    or tname.endswith("/cmd_vel")
+                ):
+                    preferred_cmds.append(tname)
+            if preferred_cmds:
+                cmd_topics = preferred_cmds
+
             print(f"[bag] Selected topics:")
             print(f"   odom: {odom_topic}")
             print(f"   pose: {pose_topic}")
             print(f"   map:  {map_topic}")
             print(f"   up:   {map_up_topic}")
+            print(f"   gc:   {gc_topic}")
+            print(f"   lc:   {lc_topic}")
             print(f"   tf*:  {tf_topics}")
             print(f"   scan: {scan_topic}")
+            print(f"   cmd:  {cmd_topics}")
 
             # Storage
             poses_odom: List[Tuple[float, float, float, float]] = []  # (t, x_o, y_o, yaw_ob)
@@ -395,20 +558,34 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             MOVE_EPS = getattr(C, "MOVE_EPS", 0.02)
 
             map_index = _BagMapIndex()
+            gc_index = _BagMapIndex()
+            lc_index = _BagMapIndex()
             first_map_meta: Optional[_MapMeta] = None
 
-            # TF timeline candidates for map->odom
-            tf_map_odom: List[_StampedSE2] = []
+            # TF timeline candidates
+            tf_map_odom: List[_StampedSE2] = []   # map -> odom
+            tf_odom_base: List[_StampedSE2] = []  # odom -> base_link/base_footprint
 
             # Generic TF pairs for scan service
             tf_pairs: Dict[Tuple[str, str], List[_StampedSE2]] = {}
 
-            # Detect frame-name pairs to accept for map->odom
+            # Detect frame-name pairs to accept for map->odom and odom->base
             map_candidates = ["map", f"{ns}/map", "/map"]
             odom_candidates = ["odom", f"{ns}/odom", "/odom"]
+            base_candidates = [
+                "base_link",
+                f"{ns}/base_link",
+                "base_footprint",
+                f"{ns}/base_footprint",
+                "/base_link",
+                "/base_footprint",
+            ]
 
             # Scan index
             scan_index = _ScanIndex()
+
+            # Cmd_vel index
+            cmd_index = _BagCmdIndex()
 
             # Iterate bag
             while reader.has_next():
@@ -492,6 +669,54 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                     flat = np.asarray(msg.data, dtype=np.int8)
                     map_index.add_patch(t=t, x=x0, y=y0, w=w, h=h, flat=flat)
 
+                elif gc_topic and topic == gc_topic:
+                    msg = deserialize_message(raw, OccGrid)
+                    t = float(msg.header.stamp.sec) + float(
+                        msg.header.stamp.nanosec
+                    ) * 1e-9
+                    info = msg.info
+                    w, h = int(info.width), int(info.height)
+                    arr = (
+                        np.asarray(msg.data, dtype=np.int16)
+                        .reshape(h, w)
+                        .astype(np.int8, copy=False)
+                    )
+                    oyaw = _yaw_from_quat(info.origin.orientation)
+                    gc_index.add_full(
+                        t=t,
+                        w=w,
+                        h=h,
+                        res=float(info.resolution),
+                        ox=float(info.origin.position.x),
+                        oy=float(info.origin.position.y),
+                        oyaw=float(oyaw),
+                        data=arr,
+                    )
+
+                elif lc_topic and topic == lc_topic:
+                    msg = deserialize_message(raw, OccGrid)
+                    t = float(msg.header.stamp.sec) + float(
+                        msg.header.stamp.nanosec
+                    ) * 1e-9
+                    info = msg.info
+                    w, h = int(info.width), int(info.height)
+                    arr = (
+                        np.asarray(msg.data, dtype=np.int16)
+                        .reshape(h, w)
+                        .astype(np.int8, copy=False)
+                    )
+                    oyaw = _yaw_from_quat(info.origin.orientation)
+                    lc_index.add_full(
+                        t=t,
+                        w=w,
+                        h=h,
+                        res=float(info.resolution),
+                        ox=float(info.origin.position.x),
+                        oy=float(info.origin.position.y),
+                        oyaw=float(oyaw),
+                        data=arr,
+                    )
+
                 elif topic in tf_topics:
                     msg = deserialize_message(raw, TFMsg)
                     # Each TFMessage has an array of TransformStamped
@@ -509,9 +734,13 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         # store generic TF pair
                         tf_pairs.setdefault((parent, child), []).append(se)
 
-                        # also keep dedicated map->odom list for pose composition
+                        # dedicated map->odom list
                         if (parent in map_candidates) and (child in odom_candidates):
                             tf_map_odom.append(se)
+
+                        # dedicated odom->base list
+                        if (parent in odom_candidates) and (child in base_candidates):
+                            tf_odom_base.append(se)
 
                 elif scan_topic and topic == scan_topic:
                     msg = deserialize_message(raw, Laser)
@@ -530,29 +759,63 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                     )
                     scan_index.add(scan)
 
+                elif topic in cmd_topics:
+                    ttype = topics.get(topic, "")
+                    if ttype.endswith("geometry_msgs/msg/Twist"):
+                        # Plain Twist (no header): use bag timestamp
+                        msg = deserialize_message(raw, Twist)
+                        t = float(_t_ns) * 1e-9
+                        vx = float(getattr(msg.linear, "x", 0.0))
+                        vy = float(getattr(msg.linear, "y", 0.0))
+                        vz = float(getattr(msg.linear, "z", 0.0))
+                        wx = float(getattr(msg.angular, "x", 0.0))
+                        wy = float(getattr(msg.angular, "y", 0.0))
+                        wz = float(getattr(msg.angular, "z", 0.0))
+                        cmd_index.add(t, vx, vy, vz, wx, wy, wz)
+                    elif ttype.endswith("geometry_msgs/msg/TwistStamped"):
+                        msg = deserialize_message(raw, TwistStamped)
+                        t = float(msg.header.stamp.sec) + float(
+                            msg.header.stamp.nanosec
+                        ) * 1e-9
+                        twist = msg.twist
+                        vx = float(getattr(twist.linear, "x", 0.0))
+                        vy = float(getattr(twist.linear, "y", 0.0))
+                        vz = float(getattr(twist.linear, "z", 0.0))
+                        wx = float(getattr(twist.angular, "x", 0.0))
+                        wy = float(getattr(twist.angular, "y", 0.0))
+                        wz = float(getattr(twist.angular, "z", 0.0))
+                        cmd_index.add(t, vx, vy, vz, wx, wy, wz)
+
             # Sort by time
             poses_odom.sort(key=lambda p: p[0])
             tf_map_odom.sort(key=lambda s: s.t)
+            tf_odom_base.sort(key=lambda s: s.t)
             scan_index.finalize()
+            cmd_index.finalize()
 
-            # ---- Compose into MAP frame if we have TF ----
-            poses_map: List[Tuple[float, float, float, float]] = []
-            if getattr(C, "BAG_USE_TF", True) and poses_odom and tf_map_odom:
-                i_tf = 0
-                for (t, xo, yo, yaw_ob) in poses_odom:
-                    mo, i_tf = _find_latest_before(tf_map_odom, t, i_tf)
-                    # compose T_map_odom ∘ T_odom_base
-                    map_of_odom = _StampedSE2(
-                        t=mo.t, x=mo.x, y=mo.y, yaw=mo.yaw
-                    )
-                    odom_of_base = _StampedSE2(
-                        t=t, x=xo, y=yo, yaw=yaw_ob
-                    )
-                    mb = _se2_compose(map_of_odom, odom_of_base)
-                    poses_map.append((t, mb.x, mb.y, mb.yaw))
-                # rebuild path in map frame
-                path_pts = []
-                for (_, x, y, _) in poses_map:
+            # ---- Compute poses using TF odom->base (primary), with optional map->odom ----
+            poses_final: List[Tuple[float, float, float, float]] = []
+            path_pts = []
+
+            if getattr(C, "BAG_USE_TF", True) and tf_odom_base:
+                # Use TF odom->base as canonical robot pose source
+                if tf_map_odom:
+                    # Compose map->odom with odom->base to get map->base
+                    poses_map: List[Tuple[float, float, float, float]] = []
+                    i_tf = 0
+                    for ob in tf_odom_base:
+                        mo, i_tf = _find_latest_before(tf_map_odom, ob.t, i_tf)
+                        map_of_odom = _StampedSE2(t=mo.t, x=mo.x, y=mo.y, yaw=mo.yaw)
+                        odom_of_base = ob
+                        mb = _se2_compose(map_of_odom, odom_of_base)
+                        poses_map.append((ob.t, mb.x, mb.y, mb.yaw))
+                    poses_final = poses_map
+                else:
+                    # No map->odom: stay in odom frame
+                    poses_final = [(ob.t, ob.x, ob.y, ob.yaw) for ob in tf_odom_base]
+
+                # Rebuild path from poses_final
+                for (_, x, y, _) in poses_final:
                     if (
                         not path_pts
                         or (x - path_pts[-1][0]) ** 2
@@ -560,40 +823,65 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         >= MOVE_EPS**2
                     ):
                         path_pts.append((x, y))
-                poses_final = poses_map
             else:
-                # ---- Fallback: anchor odom to map origin (optional yaw) ----
-                poses_final = poses_odom
-                if (
-                    getattr(C, "BAG_ANCHOR_ODOM_TO_MAP", True)
-                    and poses_odom
-                    and map_index._versions
-                ):
-                    if first_map_meta is None:
-                        first_map_meta = map_index._versions[0][1]
-                    mx0 = float(first_map_meta.origin_x)
-                    my0 = float(first_map_meta.origin_y)
-                    myaw0 = float(first_map_meta.origin_yaw) if getattr(
-                        C, "BAG_USE_MAP_YAW", True
-                    ) else 0.0
+                # ---- Fallback: use nav_msgs/Odometry-based pose if TF odom->base is missing ----
+                poses_map: List[Tuple[float, float, float, float]] = []
+                if getattr(C, "BAG_USE_TF", True) and poses_odom and tf_map_odom:
+                    i_tf = 0
+                    for (t, xo, yo, yaw_ob) in poses_odom:
+                        mo, i_tf = _find_latest_before(tf_map_odom, t, i_tf)
+                        # compose T_map_odom ∘ T_odom_base
+                        map_of_odom = _StampedSE2(
+                            t=mo.t, x=mo.x, y=mo.y, yaw=mo.yaw
+                        )
+                        odom_of_base = _StampedSE2(
+                            t=t, x=xo, y=yo, yaw=yaw_ob
+                        )
+                        mb = _se2_compose(map_of_odom, odom_of_base)
+                        poses_map.append((t, mb.x, mb.y, mb.yaw))
+                    # rebuild path in map frame
+                    for (_, x, y, _) in poses_map:
+                        if (
+                            not path_pts
+                            or (x - path_pts[-1][0]) ** 2
+                            + (y - path_pts[-1][1]) ** 2
+                            >= MOVE_EPS**2
+                        ):
+                            path_pts.append((x, y))
+                    poses_final = poses_map
+                else:
+                    # Anchor odom to map origin if requested
+                    poses_final = poses_odom
+                    if (
+                        getattr(C, "BAG_ANCHOR_ODOM_TO_MAP", True)
+                        and poses_odom
+                        and map_index._versions
+                    ):
+                        if first_map_meta is None:
+                            first_map_meta = map_index._versions[0][1]
+                        mx0 = float(first_map_meta.origin_x)
+                        my0 = float(first_map_meta.origin_y)
+                        myaw0 = float(first_map_meta.origin_yaw) if getattr(
+                            C, "BAG_USE_MAP_YAW", True
+                        ) else 0.0
 
-                    t0, x0, y0, yaw0 = poses_odom[0]
-                    dtheta = myaw0 - yaw0
-                    c = math.cos(dtheta)
-                    s = math.sin(dtheta)
+                        t0, x0, y0, yaw0 = poses_odom[0]
+                        dtheta = myaw0 - yaw0
+                        c = math.cos(dtheta)
+                        s = math.sin(dtheta)
 
-                    anchored: List[Tuple[float, float, float, float]] = []
-                    for (t, x, y, yaw) in poses_odom:
-                        dx, dy = (x - x0), (y - y0)
-                        xr = dx * c - dy * s
-                        yr = dx * s + dy * c
-                        xm = mx0 + xr
-                        ym = my0 + yr
-                        yawm = _wrap_pi((yaw - yaw0) + myaw0)
-                        anchored.append((t, xm, ym, yawm))
-                    poses_final = anchored
+                        anchored: List[Tuple[float, float, float, float]] = []
+                        for (t, x, y, yaw) in poses_odom:
+                            dx, dy = (x - x0), (y - y0)
+                            xr = dx * c - dy * s
+                            yr = dx * s + dy * c
+                            xm = mx0 + xr
+                            ym = my0 + yr
+                            yawm = _wrap_pi((yaw - yaw0) + myaw0)
+                            anchored.append((t, xm, ym, yawm))
+                        poses_final = anchored
 
-                    # path in anchored map frame
+                    # path in (possibly anchored) frame
                     path_pts = []
                     for (_, x, y, _) in poses_final:
                         if (
@@ -604,12 +892,50 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         ):
                             path_pts.append((x, y))
 
+            # ---- Build cmd_vel prefix arrays from cmd_index ----
+            if cmd_index.times:
+                bag_cmd_times: List[float] = list(cmd_index.times)
+                bag_cmd_vx: List[float] = list(cmd_index.vx)
+                bag_cmd_vy: List[float] = list(cmd_index.vy)
+                bag_cmd_vz: List[float] = list(cmd_index.vz)
+                bag_cmd_wx: List[float] = list(cmd_index.wx)
+                bag_cmd_wy: List[float] = list(cmd_index.wy)
+                bag_cmd_wz: List[float] = list(cmd_index.wz)
+
+                bag_cmd_prefix_max_vx_fwd: List[float] = list(cmd_index.max_vx_forward_prefix)
+                bag_cmd_prefix_max_vx_rev: List[float] = list(cmd_index.max_vx_reverse_prefix)
+                bag_cmd_prefix_max_wz_abs: List[float] = list(cmd_index.max_wz_abs_prefix)
+                bag_cmd_prefix_has_lateral: List[bool] = list(cmd_index.has_lateral_prefix)
+                bag_cmd_prefix_has_ang_xy: List[bool] = list(cmd_index.has_ang_xy_prefix)
+
+                bag_cmd_t0 = cmd_index.bag_t0 if cmd_index.bag_t0 is not None else cmd_index.times[0]
+                bag_cmd_t1 = cmd_index.bag_t1 if cmd_index.bag_t1 is not None else cmd_index.times[-1]
+            else:
+                bag_cmd_times = []
+                bag_cmd_vx = []
+                bag_cmd_vy = []
+                bag_cmd_vz = []
+                bag_cmd_wx = []
+                bag_cmd_wy = []
+                bag_cmd_wz = []
+
+                bag_cmd_prefix_max_vx_fwd = []
+                bag_cmd_prefix_max_vx_rev = []
+                bag_cmd_prefix_max_wz_abs = []
+                bag_cmd_prefix_has_lateral = []
+                bag_cmd_prefix_has_ang_xy = []
+
+                bag_cmd_t0 = 0.0
+                bag_cmd_t1 = 0.0
+
             # ---- Commit to shared / core ----
             core = getattr(shared, "core", shared)
             with core.lock:
+                # pose history
                 max_ph = getattr(C, "POSE_HISTORY_MAX", 100000)
                 core.pose_history = deque(poses_final, maxlen=max_ph)
 
+                # path
                 if not hasattr(core, "path") or core.path is None:
                     max_pts = getattr(C, "PATH_MAX_POINTS", 10000)
                     core.path = deque(maxlen=max_pts)
@@ -644,17 +970,12 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                     }
 
                 core._bag_map_index = map_index
+                core._bag_global_costmap_index = gc_index
+                core._bag_local_costmap_index = lc_index
 
                 # lidar + TF info for scan service
-                base_candidates = [
-                    "base_link",
-                    f"{ns}/base_link",
-                    "base_footprint",
-                    f"{ns}/base_footprint",
-                    "/base_link",
-                    "/base_footprint",
-                ]
                 core._bag_scan_index = scan_index if scan_index._scans else None
+                core._bag_cmd_index = cmd_index if cmd_index.times else None
                 core._bag_tf_pairs = tf_pairs
                 core._bag_names = {
                     "ns": ns,
@@ -663,10 +984,29 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                     "base_candidates": base_candidates,
                 }
 
+                # ---- Commit cmd_vel prefix arrays for /cmd_stats_at ----
+                core.bag_cmd_times = bag_cmd_times
+                core.bag_cmd_vx = bag_cmd_vx
+                core.bag_cmd_vy = bag_cmd_vy
+                core.bag_cmd_vz = bag_cmd_vz
+                core.bag_cmd_wx = bag_cmd_wx
+                core.bag_cmd_wy = bag_cmd_wy
+                core.bag_cmd_wz = bag_cmd_wz
+
+                core.bag_cmd_prefix_max_vx_fwd = bag_cmd_prefix_max_vx_fwd
+                core.bag_cmd_prefix_max_vx_rev = bag_cmd_prefix_max_vx_rev
+                core.bag_cmd_prefix_max_wz_abs = bag_cmd_prefix_max_wz_abs
+                core.bag_cmd_prefix_has_lateral = bag_cmd_prefix_has_lateral
+                core.bag_cmd_prefix_has_ang_xy = bag_cmd_prefix_has_ang_xy
+
+                core.bag_cmd_t0 = bag_cmd_t0
+                core.bag_cmd_t1 = bag_cmd_t1
+
             print(
                 f"[bag] Index complete: poses={len(poses_final)}, path_pts={len(path_pts)}, "
                 f"map_versions={len(map_index._versions)}, tf_map_odom={len(tf_map_odom)}, "
-                f"scans={len(scan_index._scans)}"
+                f"tf_odom_base={len(tf_odom_base)}, scans={len(scan_index._scans)}, "
+                f"cmd_samples={len(cmd_index.times)}"
             )
 
         except Exception as e:
@@ -677,8 +1017,25 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             core = getattr(shared, "core", shared)
             with core.lock:
                 core._bag_map_index = None
+                core._bag_global_costmap_index = None
+                core._bag_local_costmap_index = None
                 core._bag_scan_index = None
+                core._bag_cmd_index = None
                 core._bag_tf_pairs = {}
                 core._bag_names = {}
+                core.bag_cmd_times = []
+                core.bag_cmd_vx = []
+                core.bag_cmd_vy = []
+                core.bag_cmd_vz = []
+                core.bag_cmd_wx = []
+                core.bag_cmd_wy = []
+                core.bag_cmd_wz = []
+                core.bag_cmd_prefix_max_vx_fwd = []
+                core.bag_cmd_prefix_max_vx_rev = []
+                core.bag_cmd_prefix_max_wz_abs = []
+                core.bag_cmd_prefix_has_lateral = []
+                core.bag_cmd_prefix_has_ang_xy = []
+                core.bag_cmd_t0 = 0.0
+                core.bag_cmd_t1 = 0.0
 
     threading.Thread(target=_worker, daemon=True).start()

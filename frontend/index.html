@@ -19,11 +19,56 @@
       <button id="liveBtn" title="Jump to live">Live</button>
     </div>
 
+    <!-- View Menu -->
+    <div class="dropdown">
+      <button id="viewMenuBtn">View ▼</button>
+      <div class="dropdown-content">
+        
+        <!-- Topics Submenu -->
+        <div class="dropdown-item has-submenu">
+          <span>Topics ▶</span>
+          <div class="submenu-content">
+            <label><input type="checkbox" id="toggleGlobalCostmap" checked> Global Costmap</label>
+            <label><input type="checkbox" id="toggleLocalCostmap" checked> Local Costmap</label>
+            <label><input type="checkbox" id="toggleLidar" checked> Lidar Scan</label>
+          </div>
+        </div>
+
+        <!-- Windows Submenu -->
+        <div class="dropdown-item has-submenu">
+          <span>Windows ▶</span>
+          <div class="submenu-content">
+            <label><input type="checkbox" id="toggleCmdOverlay"> Cmd Vel Plot</label>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
     <div id="status">—</div>
   </div>
 
   <div id="canvas-wrap">
     <canvas id="view"></canvas>
+
+    <!-- cmd_vel analysis overlay; absolutely positioned on top of canvas -->
+    <div id="cmdOverlay" class="cmd-overlay hidden">
+      <div class="cmd-overlay-header">
+        <span class="cmd-overlay-title">cmd_vel analysis</span>
+      </div>
+      <div class="cmd-overlay-body">
+        <canvas id="cmdOverlayCanvas"></canvas>
+        <div class="cmd-overlay-metrics">
+          <div id="cmdInstantNumbers" class="cmd-metrics-block"></div>
+          <div id="cmdPrefixNumbers" class="cmd-metrics-block"></div>
+        </div>
+      </div>
+      <div class="cmd-overlay-footer">
+        <span class="cmd-overlay-hint">
+          Bag mode only · start → slider time
+        </span>
+      </div>
+    </div>
   </div>
 
   <div id="bagPanel" class="hidden">

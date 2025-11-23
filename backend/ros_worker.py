@@ -140,6 +140,15 @@ class CmdVelNode(Node):
             f"[map] Subscribed to {C.MAP_TOPIC} and {C.MAP_UPDATES_TOPIC}"
         )
 
+        # 5) Global Costmap
+        self.sub_gc = self.create_subscription(
+            OccupancyGrid, "/a300_0000/global_costmap/costmap", self.on_global_costmap, 1
+        )
+        # 6) Local Costmap
+        self.sub_lc = self.create_subscription(
+            OccupancyGrid, "/a300_0000/local_costmap/costmap", self.on_local_costmap, 1
+        )
+
         # ------------------------------------------------------------------
         # PUBLISHER for reverse-replay (we will publish TwistStamped)
         # ------------------------------------------------------------------
@@ -241,6 +250,54 @@ class CmdVelNode(Node):
             "data": list(up.data),
         }
         self.core.apply_map_patch(patch)
+
+    def on_global_costmap(self, msg: OccupancyGrid):
+        info = msg.info
+        w, h = info.width, info.height
+        arr = (
+            np.asarray(msg.data, dtype=np.int16).reshape(h, w).astype(np.int8, copy=False)
+        )
+        q = info.origin.orientation
+        ysqr = q.y * q.y
+        t3 = 2.0 * (q.w * q.z + q.x * q.y)
+        t4 = 1.0 - 2.0 * (ysqr + q.z * q.z)
+        yaw0 = math.atan2(t3, t4)
+
+        meta = {
+            "width": int(w),
+            "height": int(h),
+            "resolution": float(info.resolution),
+            "origin": {
+                "x": float(info.origin.position.x),
+                "y": float(info.origin.position.y),
+                "yaw": float(yaw0),
+            },
+        }
+        self.core.set_global_costmap(arr, meta)
+
+    def on_local_costmap(self, msg: OccupancyGrid):
+        info = msg.info
+        w, h = info.width, info.height
+        arr = (
+            np.asarray(msg.data, dtype=np.int16).reshape(h, w).astype(np.int8, copy=False)
+        )
+        q = info.origin.orientation
+        ysqr = q.y * q.y
+        t3 = 2.0 * (q.w * q.z + q.x * q.y)
+        t4 = 1.0 - 2.0 * (ysqr + q.z * q.z)
+        yaw0 = math.atan2(t3, t4)
+
+        meta = {
+            "width": int(w),
+            "height": int(h),
+            "resolution": float(info.resolution),
+            "origin": {
+                "x": float(info.origin.position.x),
+                "y": float(info.origin.position.y),
+                "yaw": float(yaw0),
+            },
+        }
+        self.core.set_local_costmap(arr, meta)
 
     # ======================================================================
     # ODOM (forced)

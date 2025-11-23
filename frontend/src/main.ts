@@ -1,3 +1,5 @@
+// frontend/src/main.ts
+
 import * as d3 from "d3";
 import {
   MapMeta,
@@ -9,6 +11,7 @@ import {
   PathWSMessage,
   MapWSMessage,
   ScanAtResponse,
+  CmdStatsResponse,
 } from "./types";
 
 /**
@@ -17,6 +20,7 @@ import {
  * - Bag mode: timeline frozen to bag duration; play/pause + scrub.
  * - Map “time-travel”: in bag mode fetch exact map at slider time.
  * - During play, apply map *patches* between frames for progressive refining.
+ * - cmd_vel overlay: bag-mode only, window on top of canvas, driven by /cmd_stats_at.
  */
 
 // Augment window for a cached map meta (set by live WS on connect)
@@ -48,6 +52,21 @@ const bagPanel = document.getElementById("bagPanel") as HTMLDivElement | null;
 const bagPanelClose = document.getElementById("bagPanelClose") as HTMLButtonElement | null;
 const bagPanelStatus = document.getElementById("bagPanelStatus") as HTMLParagraphElement | null;
 const bagList = document.getElementById("bagList") as HTMLUListElement | null;
+
+// cmd_vel overlay elements
+// cmd_vel overlay elements
+// const cmdOverlayToggle = document.getElementById("cmdOverlayToggle") as HTMLButtonElement | null; // Removed
+const cmdOverlay = document.getElementById("cmdOverlay") as HTMLDivElement | null;
+const cmdOverlayCanvas = document.getElementById("cmdOverlayCanvas") as HTMLCanvasElement | null;
+const cmdInstantNumbers = document.getElementById("cmdInstantNumbers") as HTMLDivElement | null;
+const cmdPrefixNumbers = document.getElementById("cmdPrefixNumbers") as HTMLDivElement | null;
+const cmdOverlayCtx = cmdOverlayCanvas ? cmdOverlayCanvas.getContext("2d") : null;
+
+// View Menu Toggles
+const toggleGlobalCostmap = document.getElementById("toggleGlobalCostmap") as HTMLInputElement | null;
+const toggleLocalCostmap = document.getElementById("toggleLocalCostmap") as HTMLInputElement | null;
+const toggleLidar = document.getElementById("toggleLidar") as HTMLInputElement | null;
+const toggleCmdOverlay = document.getElementById("toggleCmdOverlay") as HTMLInputElement | null;
 
 // Guard essentials
 if (!slider || !timeLabel || !liveModeBtn) {
@@ -115,6 +134,23 @@ let isMapLoading = false; // draw shimmer overlay while fetching
 let scanPoints: Float32Array | null = null;
 let lastScanReqAbsT: number | null = null;
 let scanReqInFlight = false;
+
+// cmd_vel overlay state (bag mode only)
+let cmdOverlayEnabled = false;
+let cmdStats: CmdStatsResponse | null = null;
+let lastCmdStatsReqAbsT: number | null = null;
+let cmdStatsReqInFlight = false;
+
+// Costmap layers
+let globalCostmapLayer: MapTiles | null = null;
+let currentGlobalCostmapVersion = -999;
+let localCostmapLayer: MapTiles | null = null;
+let currentLocalCostmapVersion = -999;
+
+// Visibility flags
+let showGlobalCostmap = true;
+let showLocalCostmap = true;
+let showLidar = true;
 
 // ==============================
 // Helpers
@@ -232,6 +268,224 @@ async function waitForStablePoseHistory({
 }
 
 // ==============================
+// cmd_vel overlay helpers
+// ==============================
+function setCmdOverlayVisible(on: boolean): void {
+  cmdOverlayEnabled = on;
+  if (!cmdOverlay) return;
+  if (on) {
+    cmdOverlay.classList.remove("hidden");
+  } else {
+    cmdOverlay.classList.add("hidden");
+  }
+}
+
+function describeInstant(stats: CmdStatsResponse | null): string {
+  if (!stats || !stats.instant) {
+    if (!isBagMode) {
+      return "Overlay available in bag mode.\nChoose a bag and scrub the timeline.";
+    }
+    return "No cmd_vel yet at this time.";
+  }
+  const i = stats.instant;
+  const vMag = Math.sqrt(i.vx * i.vx + i.vy * i.vy + i.vz * i.vz);
+  const yawDir =
+    i.wz > 1e-4 ? "CCW" : i.wz < -1e-4 ? "CW" : "no yaw";
+
+  return [
+    `t ≈ ${i.t.toFixed(3)} s`,
+    `vx = ${i.vx.toFixed(3)} m/s`,
+    `vy = ${i.vy.toFixed(3)} m/s`,
+    `wz = ${i.wz.toFixed(3)} rad/s (${yawDir})`,
+    `‖v‖ = ${vMag.toFixed(3)} m/s`,
+  ].join("\n");
+}
+
+function describePrefix(stats: CmdStatsResponse | null): string {
+  if (!stats || !stats.prefix) {
+    return "No cmd_vel samples in bag.";
+  }
+  const p = stats.prefix;
+  const span = (p.t1 - p.t0);
+  return [
+    `samples: ${p.sample_count}`,
+    `span: ${span > 0 ? span.toFixed(2) : "0.00"} s`,
+    `max forward vx: ${p.max_vx_forward.toFixed(3)} m/s`,
+    `max reverse vx: ${p.max_vx_reverse.toFixed(3)} m/s`,
+    `max |wz|: ${p.max_wz_abs.toFixed(3)} rad/s`,
+    `lateral cmds: ${p.has_lateral ? "YES" : "no"}`,
+    `weird axis ωx/ωy: ${p.has_ang_xy ? "YES" : "no"}`,
+  ].join("\n");
+}
+
+function updateCmdOverlayNumbers(): void {
+  if (!cmdInstantNumbers || !cmdPrefixNumbers) return;
+
+  cmdInstantNumbers.textContent = describeInstant(cmdStats);
+  cmdPrefixNumbers.textContent = describePrefix(cmdStats);
+}
+
+function requestCmdStatsAtAbs(absT: number): void {
+  if (!cmdOverlayEnabled) return;
+  if (!isBagMode || t0 == null) return;
+  if (cmdStatsReqInFlight) return;
+  if (lastCmdStatsReqAbsT != null && Math.abs(absT - lastCmdStatsReqAbsT) < 0.03) return;
+
+  cmdStatsReqInFlight = true;
+  lastCmdStatsReqAbsT = absT;
+
+  (async () => {
+    try {
+      const url = `/api/v1/cmd_stats_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        cmdStats = null;
+        updateCmdOverlayNumbers();
+        return;
+      }
+      const j = (await r.json()) as CmdStatsResponse;
+      cmdStats = j;
+      updateCmdOverlayNumbers();
+    } catch {
+      cmdStats = null;
+      updateCmdOverlayNumbers();
+    } finally {
+      cmdStatsReqInFlight = false;
+    }
+  })();
+}
+
+function resizeCmdOverlayCanvas(): void {
+  if (!cmdOverlayCanvas || !cmdOverlayCtx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cmdOverlayCanvas.clientWidth || 220;
+  const cssH = cmdOverlayCanvas.clientHeight || 140;
+  const w = Math.round(cssW * dpr);
+  const h = Math.round(cssH * dpr);
+  if (cmdOverlayCanvas.width !== w || cmdOverlayCanvas.height !== h) {
+    cmdOverlayCanvas.width = w;
+    cmdOverlayCanvas.height = h;
+  }
+}
+
+function drawCmdOverlayMini(): void {
+  if (!cmdOverlay || cmdOverlay.classList.contains("hidden")) return;
+  if (!cmdOverlayCanvas || !cmdOverlayCtx) return;
+
+  resizeCmdOverlayCanvas();
+  const dpr = window.devicePixelRatio || 1;
+  const w = cmdOverlayCanvas.width;
+  const h = cmdOverlayCanvas.height;
+
+  cmdOverlayCtx.save();
+  cmdOverlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+  cmdOverlayCtx.clearRect(0, 0, w, h);
+
+  // Work in CSS pixels internally
+  const cw = w / dpr;
+  const ch = h / dpr;
+  cmdOverlayCtx.scale(dpr, dpr);
+
+  // Background
+  cmdOverlayCtx.fillStyle = "#f9fafb";
+  cmdOverlayCtx.fillRect(0, 0, cw, ch);
+
+  const cx = cw * 0.5;
+  const cy = ch * 0.6;
+
+  // Robot body (upright, abstract)
+  const bodyW = cw * 0.28;
+  const bodyH = ch * 0.22;
+  cmdOverlayCtx.save();
+  cmdOverlayCtx.translate(cx, cy);
+  cmdOverlayCtx.fillStyle = "#111827";
+  cmdOverlayCtx.beginPath();
+  cmdOverlayCtx.moveTo(bodyW * 0.5, 0);
+  cmdOverlayCtx.lineTo(-bodyW * 0.4, bodyH * 0.5);
+  cmdOverlayCtx.lineTo(-bodyW * 0.4, -bodyH * 0.5);
+  cmdOverlayCtx.closePath();
+  cmdOverlayCtx.fill();
+  cmdOverlayCtx.restore();
+
+  if (!cmdStats || !cmdStats.instant) {
+    cmdOverlayCtx.fillStyle = "#6b7280";
+    cmdOverlayCtx.font = "11px system-ui, sans-serif";
+    cmdOverlayCtx.textAlign = "center";
+    cmdOverlayCtx.textBaseline = "middle";
+    cmdOverlayCtx.fillText("No cmd_vel at this time", cx, ch * 0.25);
+    cmdOverlayCtx.restore();
+    return;
+  }
+
+  const i = cmdStats.instant;
+
+  // Draw linear velocity arrow in robot frame
+  const vx = i.vx;
+  const vy = i.vy;
+  const speed = Math.sqrt(vx * vx + vy * vy);
+  const maxSpeedRef =
+    cmdStats.prefix && cmdStats.prefix.sample_count > 0
+      ? Math.max(
+        Math.abs(cmdStats.prefix.max_vx_forward),
+        Math.abs(cmdStats.prefix.max_vx_reverse),
+        0.05
+      )
+      : Math.max(Math.abs(vx), 0.05);
+
+  const maxArrowLen = cw * 0.38;
+  const arrowLen = Math.min(maxArrowLen, (speed / maxSpeedRef) * maxArrowLen);
+
+  let dirX = 1;
+  let dirY = 0;
+  if (speed > 1e-5) {
+    dirX = vx / speed;
+    dirY = -vy / speed; // screen y down, robot +y left
+  }
+
+  const ax = cx + dirX * arrowLen;
+  const ay = cy + dirY * arrowLen;
+
+  cmdOverlayCtx.strokeStyle = "#f97316";
+  cmdOverlayCtx.lineWidth = 2;
+  cmdOverlayCtx.beginPath();
+  cmdOverlayCtx.moveTo(cx, cy);
+  cmdOverlayCtx.lineTo(ax, ay);
+  cmdOverlayCtx.stroke();
+
+  // Arrowhead
+  const headSize = 6;
+  const angle = Math.atan2(dirY, dirX);
+  cmdOverlayCtx.beginPath();
+  cmdOverlayCtx.moveTo(ax, ay);
+  cmdOverlayCtx.lineTo(
+    ax - headSize * Math.cos(angle - Math.PI / 6),
+    ay - headSize * Math.sin(angle - Math.PI / 6)
+  );
+  cmdOverlayCtx.lineTo(
+    ax - headSize * Math.cos(angle + Math.PI / 6),
+    ay - headSize * Math.sin(angle + Math.PI / 6)
+  );
+  cmdOverlayCtx.closePath();
+  cmdOverlayCtx.fillStyle = "#f97316";
+  cmdOverlayCtx.fill();
+
+  // Angular velocity arc (yaw only)
+  const wz = i.wz;
+  const wzAbs = Math.abs(wz);
+  const baseRadius = bodyW * 0.9;
+  const angSign = wz >= 0 ? 1 : -1;
+  const angSpan = Math.min(Math.PI * 0.85, (wzAbs / ((cmdStats.prefix?.max_wz_abs || wzAbs || 0.1))) * Math.PI * 0.85);
+
+  cmdOverlayCtx.strokeStyle = "#2563eb";
+  cmdOverlayCtx.lineWidth = 1.5;
+  cmdOverlayCtx.beginPath();
+  cmdOverlayCtx.arc(cx, cy, baseRadius, -Math.PI * 0.7, -Math.PI * 0.7 + angSign * angSpan);
+  cmdOverlayCtx.stroke();
+
+  cmdOverlayCtx.restore();
+}
+
+// ==============================
 // Map tiles
 // ==============================
 type TileCell = {
@@ -241,6 +495,22 @@ type TileCell = {
   tw: number;
   th: number;
   flashUntil: number; // ms timestamp (performance.now)
+};
+
+type PaletteFn = (v: number) => [number, number, number, number];
+
+const mapPalette: PaletteFn = (v) => {
+  if (v === -1) return [160, 160, 160, 255];
+  if (v >= 65) return [0, 0, 0, 255];
+  return [255, 255, 255, 255];
+};
+
+const costmapPalette: PaletteFn = (v) => {
+  if (v <= 0) return [0, 0, 0, 0];
+  if (v >= 99) return [255, 0, 255, 200]; // lethal
+  // gradient red
+  const alpha = Math.min(200, Math.floor((v / 100) * 200));
+  return [255, 0, 0, alpha];
 };
 
 class MapTiles {
@@ -253,13 +523,15 @@ class MapTiles {
   rows: number;
   data: Int8Array;
   tiles: TileCell[][];
+  palette: PaletteFn;
 
-  constructor(meta: MapMeta) {
+  constructor(meta: MapMeta, palette: PaletteFn = mapPalette) {
     this.w = meta.width;
     this.h = meta.height;
     this.res = meta.resolution;
     this.origin = meta.origin;
     this.tileSize = meta.tile_size || 256;
+    this.palette = palette;
 
     this.cols = Math.ceil(this.w / this.tileSize);
     this.rows = Math.ceil(this.h / this.tileSize);
@@ -288,13 +560,6 @@ class MapTiles {
     for (let r = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++) this.tiles[r][c].dirty = true;
   }
 
-  private _colorOf(v: number): number {
-    if (v === -1) return 160; // unknown
-    if (v >= 65) return 0; // occupied
-    return 255; // free
-    // tweak later for prettier palette if needed
-  }
-
   private _rebuildTile(r: number, c: number): void {
     const t = this.tiles[r][c];
     const tw = t.tw,
@@ -307,12 +572,12 @@ class MapTiles {
       const dstRow = (th - 1 - yy) * tw;
       for (let xx = 0; xx < tw; xx++) {
         const v = this.data[srcRow + xx];
-        const g = this._colorOf(v);
+        const [R, G, B, A] = this.palette(v);
         const i = (dstRow + xx) * 4;
-        img.data[i + 0] = g;
-        img.data[i + 1] = g;
-        img.data[i + 2] = g;
-        img.data[i + 3] = 255;
+        img.data[i + 0] = R;
+        img.data[i + 1] = G;
+        img.data[i + 2] = B;
+        img.data[i + 3] = A;
       }
     }
     t.ctx.putImageData(img, 0, 0);
@@ -528,6 +793,64 @@ async function fetchMapDeltaBetween(absT0: number, absT1: number): Promise<void>
   }
 }
 
+async function fetchCostmapsAtRel(rel: number): Promise<void> {
+  console.log(`[costmap] fetchAtRel ${rel}, isBag=${isBagMode}, t0=${t0}`);
+  if (!isBagMode || t0 == null) return;
+  const absT = t0 + rel;
+  console.log(`[costmap] fetching for absT=${absT}`);
+
+  // Global
+  try {
+    const r = await fetch(`/api/v1/costmap/global/full_at?t=${encodeURIComponent(absT.toFixed(3))}`);
+    if (r.ok) {
+      const j = (await r.json()) as MapFullAtResponse;
+      const meta = j.meta;
+      const version = meta.version ?? 0;
+      const needsRebuild =
+        !globalCostmapLayer ||
+        version !== currentGlobalCostmapVersion ||
+        globalCostmapLayer.w !== meta.width ||
+        globalCostmapLayer.h !== meta.height;
+
+      if (needsRebuild) {
+        globalCostmapLayer = new MapTiles(meta, costmapPalette);
+        currentGlobalCostmapVersion = version;
+      }
+      globalCostmapLayer!.loadFull(Int8Array.from(j.data));
+    } else {
+      // If 404 or empty, maybe clear it?
+      // globalCostmapLayer = null; 
+    }
+  } catch {
+    // ignore
+  }
+
+  // Local
+  try {
+    const r = await fetch(`/api/v1/costmap/local/full_at?t=${encodeURIComponent(absT.toFixed(3))}`);
+    if (r.ok) {
+      const j = (await r.json()) as MapFullAtResponse;
+      const meta = j.meta;
+      const version = meta.version ?? 0;
+      const needsRebuild =
+        !localCostmapLayer ||
+        version !== currentLocalCostmapVersion ||
+        localCostmapLayer.w !== meta.width ||
+        localCostmapLayer.h !== meta.height;
+
+      if (needsRebuild) {
+        localCostmapLayer = new MapTiles(meta, costmapPalette);
+        currentLocalCostmapVersion = version;
+      }
+      localCostmapLayer!.loadFull(Int8Array.from(j.data));
+    } else {
+      // localCostmapLayer = null;
+    }
+  } catch {
+    // ignore
+  }
+}
+
 // ==============================
 // Lidar scan fetch (bag mode)
 // ==============================
@@ -638,6 +961,12 @@ async function startBagReplay(name: string): Promise<void> {
   lastScanReqAbsT = null;
   scanReqInFlight = false;
 
+  // reset cmd overlay stats for new bag
+  cmdStats = null;
+  lastCmdStatsReqAbsT = null;
+  cmdStatsReqInFlight = false;
+  updateCmdOverlayNumbers();
+
   setStatus(`Replaying bag: ${name}`);
   closeBagPanel();
 
@@ -649,9 +978,12 @@ async function startBagReplay(name: string): Promise<void> {
   // Fetch exact map at end and prime delta state
   const dur = getDuration();
   await fetchMapAtRel(dur);
+  await fetchCostmapsAtRel(dur);
   lastAbsTForDelta = (t0 ?? 0) + dur;
   if (t0 != null) {
-    requestScanAtAbs(t0 + dur);
+    const absEnd = t0 + dur;
+    requestScanAtAbs(absEnd);
+    if (cmdOverlayEnabled) requestCmdStatsAtAbs(absEnd);
   }
 }
 
@@ -679,6 +1011,13 @@ function startPlayback(): void {
         lastAbsTForDelta = targetAbs;
       }
       requestScanAtAbs(targetAbs);
+      if (cmdOverlayEnabled) requestCmdStatsAtAbs(targetAbs);
+
+      // Fetch costmaps occasionally (e.g. every 1s or if moved significantly?)
+      // For now, let's just fetch them if we have bandwidth, or maybe throttle?
+      // Let's try fetching every time for now to see if it works, but maybe check if busy?
+      // Actually, let's just call it. The browser limits parallel requests anyway.
+      void fetchCostmapsAtRel(rel);
     }, 1000 / 25);
   }
 
@@ -750,6 +1089,12 @@ liveModeBtn.onclick = async () => {
   scanPoints = null;
   lastScanReqAbsT = null;
   scanReqInFlight = false;
+
+  // cmd overlay is still visible but there is no bag-based data anymore
+  cmdStats = null;
+  lastCmdStatsReqAbsT = null;
+  cmdStatsReqInFlight = false;
+  updateCmdOverlayNumbers();
 
   await loadPoseHistoryOnce();
   setTimelineFromPoseHist();
@@ -832,6 +1177,7 @@ slider!.addEventListener("input", () => {
   scrubPose = poseAt(scrubTime);
   if (isBagMode && scrubTime != null) {
     requestScanAtAbs(scrubTime);
+    if (cmdOverlayEnabled) requestCmdStatsAtAbs(scrubTime);
   }
 });
 
@@ -840,8 +1186,11 @@ slider!.addEventListener("change", async () => {
   if (!isBagMode) return; // live mode uses WS/REST live map
   const rel = Number(slider!.value);
   await fetchMapAtRel(rel);
-  lastAbsTForDelta = t0 + rel; // resync delta base to playhead
-  requestScanAtAbs(t0 + rel);
+  await fetchCostmapsAtRel(rel);
+  const absT = t0 + rel;
+  lastAbsTForDelta = absT; // resync delta base to playhead
+  requestScanAtAbs(absT);
+  if (cmdOverlayEnabled) requestCmdStatsAtAbs(absT);
 });
 
 // Jump-to-live (ignored in bag mode)
@@ -859,6 +1208,44 @@ function jumpToLive(): void {
   updateTimeUI(rel);
   scrubTime = null;
   scrubPose = null;
+}
+
+// ==============================
+// cmd_vel overlay toggle
+// ==============================
+// ==============================
+// View Menu Interactions
+// ==============================
+if (toggleGlobalCostmap) {
+  toggleGlobalCostmap.addEventListener("change", () => {
+    showGlobalCostmap = toggleGlobalCostmap.checked;
+  });
+}
+if (toggleLocalCostmap) {
+  toggleLocalCostmap.addEventListener("change", () => {
+    showLocalCostmap = toggleLocalCostmap.checked;
+  });
+}
+if (toggleLidar) {
+  toggleLidar.addEventListener("change", () => {
+    showLidar = toggleLidar.checked;
+  });
+}
+if (toggleCmdOverlay) {
+  toggleCmdOverlay.addEventListener("change", () => {
+    const next = toggleCmdOverlay.checked;
+    setCmdOverlayVisible(next);
+    if (next) {
+      if (isBagMode && t0 != null) {
+        const rel = Number(slider!.value) || 0;
+        const absT = t0 + rel;
+        requestCmdStatsAtAbs(absT);
+      } else {
+        cmdStats = null;
+        updateCmdOverlayNumbers();
+      }
+    }
+  });
 }
 
 // ==============================
@@ -981,12 +1368,14 @@ function draw(): void {
   };
 
   if (mapLayer) mapLayer.draw(ctx, world2screen, viewport);
+  if (showGlobalCostmap && globalCostmapLayer) globalCostmapLayer.draw(ctx, world2screen, viewport);
+  if (showLocalCostmap && localCostmapLayer) localCostmapLayer.draw(ctx, world2screen, viewport);
 
   drawGrid(1.0, "rgba(0, 0, 0, 0.08)");
   drawGrid(0.25, "rgba(0, 0, 0, 0.035)");
 
   // Lidar scan (on top of map/grid)
-  drawLidar();
+  if (showLidar) drawLidar();
 
   if (path.length > 1) {
     ctx.beginPath();
@@ -1017,6 +1406,10 @@ function draw(): void {
   }
 
   ctx.restore();
+
+  // Draw cmd_vel mini overlay canvas (separate canvas)
+  drawCmdOverlayMini();
+
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);

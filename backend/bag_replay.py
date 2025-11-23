@@ -58,7 +58,9 @@ class _MapMeta:
     origin_x: float
     origin_y: float
     origin_yaw: float
+    origin_yaw: float
     version: int
+    frame_id: str = "map"
 
 
 class _BagMapIndex:
@@ -82,10 +84,11 @@ class _BagMapIndex:
         ox: float,
         oy: float,
         oyaw: float,
+        frame_id: str,
         data: np.ndarray,
     ):
         version = len(self._versions) + 1
-        meta = _MapMeta(w, h, res, ox, oy, oyaw, version)
+        meta = _MapMeta(w, h, res, ox, oy, oyaw, version, frame_id)
         base = np.asarray(data, dtype=np.int8).reshape(h, w).copy(order="C")
         self._versions.append((t, meta, base))
         self._patches[version] = []
@@ -646,6 +649,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         ox=float(info.origin.position.x),
                         oy=float(info.origin.position.y),
                         oyaw=float(oyaw),
+                        frame_id=msg.header.frame_id,
                         data=arr,
                     )
                     if first_map_meta is None:
@@ -657,6 +661,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                             float(info.origin.position.y),
                             float(oyaw),
                             version=1,
+                            frame_id=msg.header.frame_id,
                         )
 
                 elif map_up_topic and topic == map_up_topic:
@@ -690,6 +695,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         ox=float(info.origin.position.x),
                         oy=float(info.origin.position.y),
                         oyaw=float(oyaw),
+                        frame_id=msg.header.frame_id,
                         data=arr,
                     )
 
@@ -714,6 +720,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         ox=float(info.origin.position.x),
                         oy=float(info.origin.position.y),
                         oyaw=float(oyaw),
+                        frame_id=msg.header.frame_id,
                         data=arr,
                     )
 

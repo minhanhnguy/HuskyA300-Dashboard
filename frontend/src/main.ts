@@ -505,10 +505,18 @@ const mapPalette: PaletteFn = (v) => {
   return [255, 255, 255, 255];
 };
 
-const costmapPalette: PaletteFn = (v) => {
+const globalCostmapPalette: PaletteFn = (v) => {
   if (v <= 0) return [0, 0, 0, 0];
-  if (v >= 99) return [255, 0, 255, 200]; // lethal
-  // gradient red
+  if (v >= 99) return [0, 255, 255, 150]; // lethal: cyan
+  // gradient blue/green, more transparent
+  const alpha = Math.min(100, Math.floor((v / 100) * 150));
+  return [0, 255, 0, alpha];
+};
+
+const localCostmapPalette: PaletteFn = (v) => {
+  if (v <= 0) return [0, 0, 0, 0];
+  if (v >= 99) return [255, 0, 255, 200]; // lethal: magenta
+  // gradient red, more opaque
   const alpha = Math.min(200, Math.floor((v / 100) * 200));
   return [255, 0, 0, alpha];
 };
@@ -590,51 +598,83 @@ class MapTiles {
     viewport: { xMin: number; xMax: number; yMin: number; yMax: number }
   ): void {
     if (!this.data) return;
-    const xMin = Math.floor((viewport.xMin - this.origin.x) / this.res);
-    const xMax = Math.ceil((viewport.xMax - this.origin.x) / this.res);
-    const yMin = Math.floor((viewport.yMin - this.origin.y) / this.res);
-    const yMax = Math.ceil((viewport.yMax - this.origin.y) / this.res);
-    const c0 = Math.max(0, Math.floor(xMin / this.tileSize));
-    const c1 = Math.min(this.cols - 1, Math.floor((xMax - 1) / this.tileSize));
-    const r0 = Math.max(0, Math.floor(yMin / this.tileSize));
-    const r1 = Math.min(this.rows - 1, Math.floor((yMax - 1) / this.tileSize));
-    const now = performance.now();
 
-    for (let r = r0; r <= r1; r++)
+    // 1. Calculate visible tile range (AABB in map frame)
+    // Transform viewport corners to map frame to find min/max col/row
+    const corners = [
+      { x: viewport.xMin, y: viewport.yMin },
+      { x: viewport.xMax, y: viewport.yMin },
+      { x: viewport.xMax, y: viewport.yMax },
+      { x: viewport.xMin, y: viewport.yMax },
+    ];
+
+    const cosYaw = Math.cos(this.origin.yaw);
+    const sinYaw = Math.sin(this.origin.yaw);
+
+    let minLx = Infinity, maxLx = -Infinity;
+    let minLy = Infinity, maxLy = -Infinity;
+
+    for (const p of corners) {
+      const dx = p.x - this.origin.x;
+      const dy = p.y - this.origin.y;
+      const lx = dx * cosYaw + dy * sinYaw;
+      const ly = -dx * sinYaw + dy * cosYaw;
+      if (lx < minLx) minLx = lx;
+      if (lx > maxLx) maxLx = lx;
+      if (ly < minLy) minLy = ly;
+      if (ly > maxLy) maxLy = ly;
+    }
+
+    const c0 = Math.max(0, Math.floor(minLx / this.res / this.tileSize));
+    const c1 = Math.min(this.cols - 1, Math.floor(maxLx / this.res / this.tileSize));
+    const r0 = Math.max(0, Math.floor(minLy / this.res / this.tileSize));
+    const r1 = Math.min(this.rows - 1, Math.floor(maxLy / this.res / this.tileSize));
+
+    const now = performance.now();
+    const k = zoomTransform.k;
+    const scale = k * this.res;
+
+    // 2. Draw visible tiles
+    for (let r = r0; r <= r1; r++) {
       for (let c = c0; c <= c1; c++) {
         const t = this.tiles[r][c];
         if (t.dirty) this._rebuildTile(r, c);
-        const cellX = c * this.tileSize,
-          cellY = r * this.tileSize;
-        const wx0 = this.origin.x + cellX * this.res;
-        const wy0 = this.origin.y + cellY * this.res;
-        const wx1 = wx0 + t.tw * this.res;
-        const wy1 = wy0 + t.th * this.res;
-        const [X0, Y0] = world2screenFn(wx0, wy0);
-        const [X1] = world2screenFn(wx1, wy0);
-        const [, Y1] = world2screenFn(wx0, wy1);
-        const sx = (X1 - X0) / t.tw,
-          sy = (Y1 - Y0) / t.th;
+
+        // Map-local coordinates of the tile's bottom-left corner (min x, min y)
+        const lx = c * this.tileSize * this.res;
+        const ly = r * this.tileSize * this.res;
+
+        // Transform to World coordinates
+        const wx = this.origin.x + lx * cosYaw - ly * sinYaw;
+        const wy = this.origin.y + lx * sinYaw + ly * cosYaw;
+
+        // Project to Screen coordinates
+        const [sx, sy] = world2screenFn(wx, wy);
 
         ctx2d.save();
         ctx2d.setTransform(1, 0, 0, 1, 0, 0);
-        ctx2d.translate(X0, Y0);
-        ctx2d.scale(Math.abs(sx), Math.abs(sy));
-        const dx = sx < 0 ? -t.tw : 0,
-          dy = sy < 0 ? -t.th : 0;
-        ctx2d.drawImage(t.canvas, dx, dy);
+        ctx2d.translate(sx, sy);
+        ctx2d.rotate(-this.origin.yaw);
+        ctx2d.scale(scale, scale);
 
-        // flash overlay (120ms) for freshly updated tiles
+        // Draw image. 
+        // Image (0,0) is Top-Left (High Map Y).
+        // We are at (sx, sy) which corresponds to Low Map Y.
+        // We want Image (0, h) [Low Map Y] to be at (0,0).
+        // So we draw at (0, -t.th).
+        ctx2d.drawImage(t.canvas, 0, -t.th);
+
+        // Flash overlay
         if (t.flashUntil > now) {
           const alpha = Math.min(0.15, ((t.flashUntil - now) / 120) * 0.15);
           ctx2d.globalAlpha = alpha;
           ctx2d.fillStyle = "#60a5fa";
-          ctx2d.fillRect(dx, dy, t.tw, t.th);
-          ctx2d.globalAlpha = 1;
+          ctx2d.fillRect(0, -t.th, t.tw, t.th);
         }
 
         ctx2d.restore();
       }
+    }
   }
 }
 
@@ -813,7 +853,7 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
         globalCostmapLayer.h !== meta.height;
 
       if (needsRebuild) {
-        globalCostmapLayer = new MapTiles(meta, costmapPalette);
+        globalCostmapLayer = new MapTiles(meta, globalCostmapPalette);
         currentGlobalCostmapVersion = version;
       }
       globalCostmapLayer!.loadFull(Int8Array.from(j.data));
@@ -839,7 +879,7 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
         localCostmapLayer.h !== meta.height;
 
       if (needsRebuild) {
-        localCostmapLayer = new MapTiles(meta, costmapPalette);
+        localCostmapLayer = new MapTiles(meta, localCostmapPalette);
         currentLocalCostmapVersion = version;
       }
       localCostmapLayer!.loadFull(Int8Array.from(j.data));

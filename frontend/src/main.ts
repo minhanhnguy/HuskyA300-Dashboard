@@ -12,6 +12,8 @@ import {
   MapWSMessage,
   ScanAtResponse,
   CmdStatsResponse,
+  PlanResponse,
+  GoalResponse,
 } from "./types";
 
 /**
@@ -66,6 +68,8 @@ const cmdOverlayCtx = cmdOverlayCanvas ? cmdOverlayCanvas.getContext("2d") : nul
 const toggleGlobalCostmap = document.getElementById("toggleGlobalCostmap") as HTMLInputElement | null;
 const toggleLocalCostmap = document.getElementById("toggleLocalCostmap") as HTMLInputElement | null;
 const toggleLidar = document.getElementById("toggleLidar") as HTMLInputElement | null;
+const togglePlan = document.getElementById("togglePlan") as HTMLInputElement | null;
+const toggleGoal = document.getElementById("toggleGoal") as HTMLInputElement | null;
 const toggleCmdOverlay = document.getElementById("toggleCmdOverlay") as HTMLInputElement | null;
 
 // Guard essentials
@@ -151,10 +155,156 @@ let currentLocalCostmapVersion = -999;
 let showGlobalCostmap = true;
 let showLocalCostmap = true;
 let showLidar = true;
+let showPlan = true;
+let showGoal = true;
 
-// ==============================
-// Helpers
-// ==============================
+// 50% path marker
+let halfwayPoint: { x: number; y: number; reached: boolean } | null = null;
+let halfwayT: { t: number; reached: boolean } | null = null;
+let poseHistDist: Float32Array | null = null;
+let fixedHalfway: { t: number; x: number; y: number } | null = null;
+
+// Plan/Goal state
+let planPath: [number, number][] | null = null;
+let goalPose: { x: number; y: number; yaw: number } | null = null;
+let planReqInFlight = false;
+let goalReqInFlight = false;
+let lastPlanReqAbsT: number | null = null;
+let lastGoalReqAbsT: number | null = null;
+
+// Robot Description (URDF)
+// Default fallback: Husky A300 (0.99m x 0.698m)
+interface RobotShape {
+  type: "box" | "cylinder" | "a300";
+  length: number; // or chassis_x
+  width: number;  // or chassis_y
+  wheel_base?: number;
+  wheel_track?: number;
+  wheel_radius?: number;
+  wheel_width?: number;
+}
+
+let robotDims: RobotShape | null = {
+  type: "a300",
+  length: 0.860,
+  width: 0.378,
+  wheel_base: 0.512,
+  wheel_track: 0.562,
+  wheel_radius: 0.1651,
+  wheel_width: 0.1143,
+};
+
+// ... (existing code) ...
+
+async function fetchRobotDescription(): Promise<void> {
+  console.log("Fetching robot description...");
+  try {
+    const r = await fetch("/api/v1/robot_description");
+    if (!r.ok) {
+      console.error("Failed to fetch robot description:", r.status, r.statusText);
+      return;
+    }
+    const j = (await r.json()) as { urdf: string };
+    if (!j.urdf) {
+      console.warn("Robot description response has no URDF data");
+      return;
+    }
+    console.log("Received URDF length:", j.urdf.length);
+
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(j.urdf, "text/xml");
+
+    // 1. Try to parse Xacro properties for A300
+    // Look for <xacro:property name="..." value="..." />
+    const props = xml.getElementsByTagName("xacro:property");
+    const valMap: Record<string, number> = {};
+    for (let i = 0; i < props.length; i++) {
+      const name = props[i].getAttribute("name");
+      const valStr = props[i].getAttribute("value");
+      if (name && valStr) {
+        const v = parseFloat(valStr);
+        if (!isNaN(v)) valMap[name] = v;
+      }
+    }
+
+    if (valMap["chassis_x_size"] && valMap["chassis_y_size"]) {
+      console.log("Detected A300 properties:", valMap);
+      robotDims = {
+        type: "a300",
+        length: valMap["chassis_x_size"],
+        width: valMap["chassis_y_size"],
+        wheel_base: valMap["wheel_base"] || 0.512,
+        wheel_track: valMap["wheel_track"] || 0.562,
+        wheel_radius: valMap["a300_outdoor_wheel_radius"] || 0.1651,
+        wheel_width: valMap["a300_outdoor_wheel_width"] || 0.1143,
+      };
+      return;
+    }
+
+    // 1b. Heuristic: Check for A300 mesh paths if properties are missing
+    if (j.urdf.includes("meshes/a300")) {
+      console.log("Detected A300 via mesh paths (using default dims)");
+      robotDims = {
+        type: "a300",
+        length: 0.860,
+        width: 0.378,
+        wheel_base: 0.512,
+        wheel_track: 0.562,
+        wheel_radius: 0.1651,
+        wheel_width: 0.1143,
+      };
+      return;
+    }
+
+    // 2. Fallback to standard URDF parsing (existing logic)
+    const robot = xml.querySelector("robot");
+    if (!robot) {
+      console.error("URDF has no <robot> tag");
+      return;
+    }
+
+    // Try to find base_link or footprint
+    let link = xml.querySelector("link[name='base_link']") || xml.querySelector("link[name='base_footprint']");
+    if (!link) {
+      // Fallback: first link with geometry
+      link = xml.querySelector("link visual geometry");
+      if (link) link = link.closest("link");
+    }
+
+    if (!link) {
+      console.error("No suitable link found in URDF");
+      return;
+    }
+
+    const geometry = link.querySelector("visual geometry");
+    if (!geometry) {
+      console.error("Link has no visual geometry");
+      return;
+    }
+
+    const box = geometry.querySelector("box");
+    const cylinder = geometry.querySelector("cylinder");
+
+    if (box) {
+      const sizeStr = box.getAttribute("size"); // "x y z"
+      if (sizeStr) {
+        const parts = sizeStr.trim().split(/\s+/).map(Number);
+        if (parts.length >= 2) {
+          robotDims = { length: parts[0], width: parts[1], type: "box" };
+          console.log("Parsed robot dims (box):", robotDims);
+        }
+      }
+    } else if (cylinder) {
+      const radius = Number(cylinder.getAttribute("radius"));
+      if (!isNaN(radius)) {
+        robotDims = { length: radius * 2, width: radius * 2, type: "cylinder" };
+        console.log("Parsed robot dims (cylinder):", robotDims);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to parse robot description:", e);
+  }
+}
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function setStatus(txt: string): void {
@@ -185,9 +335,20 @@ async function loadPoseHistoryOnce(): Promise<void> {
   if (poseHist.length) {
     t0 = poseHist[0].t;
     lastPoseCount = poseHist.length;
+
+    // Pre-calculate cumulative distances
+    poseHistDist = new Float32Array(poseHist.length);
+    poseHistDist[0] = 0;
+    for (let i = 1; i < poseHist.length; i++) {
+      const dx = poseHist[i].x - poseHist[i - 1].x;
+      const dy = poseHist[i].y - poseHist[i - 1].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      poseHistDist[i] = poseHistDist[i - 1] + d;
+    }
   } else {
     t0 = null;
     lastPoseCount = 0;
+    poseHistDist = null;
   }
 }
 
@@ -325,34 +486,32 @@ function updateCmdOverlayNumbers(): void {
   cmdPrefixNumbers.textContent = describePrefix(cmdStats);
 }
 
-function requestCmdStatsAtAbs(absT: number): void {
+async function requestCmdStatsAtAbs(absT: number): Promise<void> {
   if (!cmdOverlayEnabled) return;
   if (!isBagMode || t0 == null) return;
   if (cmdStatsReqInFlight) return;
-  if (lastCmdStatsReqAbsT != null && Math.abs(absT - lastCmdStatsReqAbsT) < 0.03) return;
+  // if (lastCmdStatsReqAbsT != null && Math.abs(absT - lastCmdStatsReqAbsT) < 0.03) return;
 
   cmdStatsReqInFlight = true;
   lastCmdStatsReqAbsT = absT;
 
-  (async () => {
-    try {
-      const url = `/api/v1/cmd_stats_at?t=${encodeURIComponent(absT.toFixed(3))}`;
-      const r = await fetch(url);
-      if (!r.ok) {
-        cmdStats = null;
-        updateCmdOverlayNumbers();
-        return;
-      }
-      const j = (await r.json()) as CmdStatsResponse;
-      cmdStats = j;
-      updateCmdOverlayNumbers();
-    } catch {
+  try {
+    const url = `/api/v1/cmd_stats_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+    const r = await fetch(url);
+    if (!r.ok) {
       cmdStats = null;
       updateCmdOverlayNumbers();
-    } finally {
-      cmdStatsReqInFlight = false;
+      return;
     }
-  })();
+    const j = (await r.json()) as CmdStatsResponse;
+    cmdStats = j;
+    updateCmdOverlayNumbers();
+  } catch {
+    cmdStats = null;
+    updateCmdOverlayNumbers();
+  } finally {
+    cmdStatsReqInFlight = false;
+  }
 }
 
 function resizeCmdOverlayCanvas(): void {
@@ -393,18 +552,101 @@ function drawCmdOverlayMini(): void {
   const cx = cw * 0.5;
   const cy = ch * 0.6;
 
-  // Robot body (upright, abstract)
-  const bodyW = cw * 0.28;
-  const bodyH = ch * 0.22;
+  // Robot body (Detailed A300 or fallback)
+  // We'll use a fixed scale for the overlay robot to fit nicely
+  const robotScale = 0.25 * (cw / 1.0); // Adjust scale to fit canvas width
+
   cmdOverlayCtx.save();
   cmdOverlayCtx.translate(cx, cy);
-  cmdOverlayCtx.fillStyle = "#111827";
-  cmdOverlayCtx.beginPath();
-  cmdOverlayCtx.moveTo(bodyW * 0.5, 0);
-  cmdOverlayCtx.lineTo(-bodyW * 0.4, bodyH * 0.5);
-  cmdOverlayCtx.lineTo(-bodyW * 0.4, -bodyH * 0.5);
-  cmdOverlayCtx.closePath();
-  cmdOverlayCtx.fill();
+  cmdOverlayCtx.scale(robotScale, robotScale);
+  // Rotate -90 deg so "up" is forward (screen Y is down, so -90 makes +x point up)
+  cmdOverlayCtx.rotate(-Math.PI / 2);
+
+  // Use the same drawing logic as drawRobot but on cmdOverlayCtx
+  // Dimensions (default A300 if not set)
+  const dims = robotDims || {
+    type: "a300",
+    length: 0.860,
+    width: 0.378,
+    wheel_base: 0.512,
+    wheel_track: 0.562,
+    wheel_radius: 0.1651,
+    wheel_width: 0.1143,
+  };
+
+  if (dims.type === "a300") {
+    const chassisL = dims.length;
+    const chassisW = dims.width;
+    const wheelBase = dims.wheel_base || 0.512;
+    const wheelTrack = dims.wheel_track || 0.562;
+    const wheelRad = dims.wheel_radius || 0.1651;
+    const wheelW = dims.wheel_width || 0.1143;
+    const wheelDiam = wheelRad * 2;
+
+    const colChassis = "#f59e0b";
+    const colDark = "#333333";
+    const colBumper = "#1f2937";
+
+    // Suspension
+    const beamW = 0.05;
+    cmdOverlayCtx.fillStyle = colDark;
+    cmdOverlayCtx.fillRect(-wheelBase / 2, wheelTrack / 2 - beamW / 2, wheelBase, beamW);
+    cmdOverlayCtx.fillRect(-wheelBase / 2, -wheelTrack / 2 - beamW / 2, wheelBase, beamW);
+
+    // Wheels
+    cmdOverlayCtx.fillStyle = colDark;
+    cmdOverlayCtx.fillRect(wheelBase / 2 - wheelDiam / 2, wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+    cmdOverlayCtx.fillRect(wheelBase / 2 - wheelDiam / 2, -wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+    cmdOverlayCtx.fillRect(-wheelBase / 2 - wheelDiam / 2, wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+    cmdOverlayCtx.fillRect(-wheelBase / 2 - wheelDiam / 2, -wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+
+    // Chassis
+    cmdOverlayCtx.fillStyle = colChassis;
+    cmdOverlayCtx.fillRect(-chassisL / 2, -chassisW / 2, chassisL, chassisW);
+
+    // Bumpers
+    const bumperDepth = 0.05;
+    const bumperWidth = chassisW + 0.02;
+    cmdOverlayCtx.fillStyle = colBumper;
+    cmdOverlayCtx.fillRect(chassisL / 2, -bumperWidth / 2, bumperDepth, bumperWidth);
+    cmdOverlayCtx.fillRect(-chassisL / 2 - bumperDepth, -bumperWidth / 2, bumperDepth, bumperWidth);
+
+    // Indicator
+    cmdOverlayCtx.fillStyle = "rgba(0,0,0,0.2)";
+    cmdOverlayCtx.fillRect(chassisL * 0.1, -chassisW * 0.3, chassisL * 0.3, chassisW * 0.6);
+    cmdOverlayCtx.fillStyle = "#ffffff";
+    cmdOverlayCtx.beginPath();
+    cmdOverlayCtx.moveTo(chassisL * 0.3, 0);
+    cmdOverlayCtx.lineTo(chassisL * 0.45, 0);
+    cmdOverlayCtx.strokeStyle = "#ffffff";
+    cmdOverlayCtx.lineWidth = 0.02;
+    cmdOverlayCtx.stroke();
+    cmdOverlayCtx.beginPath();
+    cmdOverlayCtx.moveTo(chassisL * 0.45, 0);
+    cmdOverlayCtx.lineTo(chassisL * 0.4, chassisW * 0.05);
+    cmdOverlayCtx.lineTo(chassisL * 0.4, -chassisW * 0.05);
+    cmdOverlayCtx.fill();
+
+  } else {
+    // Box/Cylinder fallback
+    const wPx = dims.width;
+    const lPx = dims.length;
+    cmdOverlayCtx.fillStyle = "#f59e0b";
+    cmdOverlayCtx.beginPath();
+    if (dims.type === "cylinder") {
+      cmdOverlayCtx.arc(0, 0, wPx / 2, 0, Math.PI * 2);
+    } else {
+      cmdOverlayCtx.rect(-lPx / 2, -wPx / 2, lPx, wPx);
+    }
+    cmdOverlayCtx.fill();
+    // Indicator
+    cmdOverlayCtx.fillStyle = "#ffffff";
+    cmdOverlayCtx.beginPath();
+    cmdOverlayCtx.moveTo(lPx / 4, 0);
+    cmdOverlayCtx.lineTo(lPx / 2, 0);
+    cmdOverlayCtx.lineWidth = 0.02;
+    cmdOverlayCtx.stroke();
+  }
   cmdOverlayCtx.restore();
 
   if (!cmdStats || !cmdStats.instant) {
@@ -412,76 +654,82 @@ function drawCmdOverlayMini(): void {
     cmdOverlayCtx.font = "11px system-ui, sans-serif";
     cmdOverlayCtx.textAlign = "center";
     cmdOverlayCtx.textBaseline = "middle";
-    cmdOverlayCtx.fillText("No cmd_vel at this time", cx, ch * 0.25);
-    cmdOverlayCtx.restore();
+    cmdOverlayCtx.fillText("No cmd_vel at this time", cx, ch * 0.9);
     return;
   }
 
   const i = cmdStats.instant;
+  const p = cmdStats.prefix;
 
-  // Draw linear velocity arrow in robot frame
+  // Draw linear velocity arrow in robot frame (rotated -90 for screen up)
   const vx = i.vx;
   const vy = i.vy;
   const speed = Math.sqrt(vx * vx + vy * vy);
-  const maxSpeedRef =
-    cmdStats.prefix && cmdStats.prefix.sample_count > 0
-      ? Math.max(
-        Math.abs(cmdStats.prefix.max_vx_forward),
-        Math.abs(cmdStats.prefix.max_vx_reverse),
-        0.05
-      )
-      : Math.max(Math.abs(vx), 0.05);
 
-  const maxArrowLen = cw * 0.38;
+  // Use prefix max for scaling if available
+  const maxSpeedRef = p && p.sample_count > 0
+    ? Math.max(Math.abs(p.max_vx_forward), Math.abs(p.max_vx_reverse), 0.5)
+    : Math.max(Math.abs(vx), 0.5);
+
+  const maxArrowLen = cw * 0.4;
   const arrowLen = Math.min(maxArrowLen, (speed / maxSpeedRef) * maxArrowLen);
 
-  let dirX = 1;
-  let dirY = 0;
-  if (speed > 1e-5) {
-    dirX = vx / speed;
-    dirY = -vy / speed; // screen y down, robot +y left
+  if (speed > 1e-3) {
+    cmdOverlayCtx.save();
+    cmdOverlayCtx.translate(cx, cy);
+    cmdOverlayCtx.rotate(-Math.PI / 2); // Robot frame
+
+    const angle = Math.atan2(vy, vx);
+    const ax = Math.cos(angle) * arrowLen;
+    const ay = Math.sin(angle) * arrowLen;
+
+    cmdOverlayCtx.strokeStyle = "#f97316";
+    cmdOverlayCtx.lineWidth = 3;
+    cmdOverlayCtx.beginPath();
+    cmdOverlayCtx.moveTo(0, 0);
+    cmdOverlayCtx.lineTo(ax, ay);
+    cmdOverlayCtx.stroke();
+
+    // Arrowhead
+    const headSize = 8;
+    cmdOverlayCtx.translate(ax, ay);
+    cmdOverlayCtx.rotate(angle);
+    cmdOverlayCtx.fillStyle = "#f97316";
+    cmdOverlayCtx.beginPath();
+    cmdOverlayCtx.moveTo(0, 0);
+    cmdOverlayCtx.lineTo(-headSize, headSize * 0.5);
+    cmdOverlayCtx.lineTo(-headSize, -headSize * 0.5);
+    cmdOverlayCtx.fill();
+
+    cmdOverlayCtx.restore();
   }
 
-  const ax = cx + dirX * arrowLen;
-  const ay = cy + dirY * arrowLen;
+  // Stats Text
+  if (p) {
+    cmdOverlayCtx.font = "10px monospace";
+    cmdOverlayCtx.fillStyle = "#111827";
+    cmdOverlayCtx.textAlign = "left";
+    cmdOverlayCtx.textBaseline = "top";
 
-  cmdOverlayCtx.strokeStyle = "#f97316";
-  cmdOverlayCtx.lineWidth = 2;
-  cmdOverlayCtx.beginPath();
-  cmdOverlayCtx.moveTo(cx, cy);
-  cmdOverlayCtx.lineTo(ax, ay);
-  cmdOverlayCtx.stroke();
+    const lineH = 12;
+    let ty = 5;
+    const tx = 5;
 
-  // Arrowhead
-  const headSize = 6;
-  const angle = Math.atan2(dirY, dirX);
-  cmdOverlayCtx.beginPath();
-  cmdOverlayCtx.moveTo(ax, ay);
-  cmdOverlayCtx.lineTo(
-    ax - headSize * Math.cos(angle - Math.PI / 6),
-    ay - headSize * Math.sin(angle - Math.PI / 6)
-  );
-  cmdOverlayCtx.lineTo(
-    ax - headSize * Math.cos(angle + Math.PI / 6),
-    ay - headSize * Math.sin(angle + Math.PI / 6)
-  );
-  cmdOverlayCtx.closePath();
-  cmdOverlayCtx.fillStyle = "#f97316";
-  cmdOverlayCtx.fill();
+    function drawStat(label: string, val: number, unit = "m/s") {
+      cmdOverlayCtx.fillText(`${label}: ${val.toFixed(2)} ${unit}`, tx, ty);
+      ty += lineH;
+    }
 
-  // Angular velocity arc (yaw only)
-  const wz = i.wz;
-  const wzAbs = Math.abs(wz);
-  const baseRadius = bodyW * 0.9;
-  const angSign = wz >= 0 ? 1 : -1;
-  const angSpan = Math.min(Math.PI * 0.85, (wzAbs / ((cmdStats.prefix?.max_wz_abs || wzAbs || 0.1))) * Math.PI * 0.85);
+    drawStat("Max Fwd", p.max_vx_forward);
+    drawStat("Max Rev", p.max_vx_reverse);
+    drawStat("Avg Vel", p.avg_vx);
 
-  cmdOverlayCtx.strokeStyle = "#2563eb";
-  cmdOverlayCtx.lineWidth = 1.5;
-  cmdOverlayCtx.beginPath();
-  cmdOverlayCtx.arc(cx, cy, baseRadius, -Math.PI * 0.7, -Math.PI * 0.7 + angSign * angSpan);
-  cmdOverlayCtx.stroke();
-
+    if (p.has_lateral) {
+      ty += 2;
+      drawStat("Max Lat", p.max_vy_abs);
+      drawStat("Avg Lat", p.avg_vy_abs);
+    }
+  }
   cmdOverlayCtx.restore();
 }
 
@@ -894,33 +1142,77 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
 // ==============================
 // Lidar scan fetch (bag mode)
 // ==============================
-function requestScanAtAbs(absT: number): void {
+async function requestScanAtAbs(absT: number): Promise<void> {
   if (!isBagMode || t0 == null) return;
   if (scanReqInFlight) return;
-  if (lastScanReqAbsT != null && Math.abs(absT - lastScanReqAbsT) < 0.03) return; // throttle
+  // if (lastScanReqAbsT != null && Math.abs(absT - lastScanReqAbsT) < 0.03) return; // throttle
 
   scanReqInFlight = true;
   lastScanReqAbsT = absT;
 
-  (async () => {
-    try {
-      const url = `/api/v1/scan_at?t=${encodeURIComponent(absT.toFixed(3))}`;
-      const r = await fetch(url);
-      if (!r.ok) {
-        return;
-      }
-      const j = (await r.json()) as ScanAtResponse;
-      if (!j || !Array.isArray(j.points) || j.count <= 0) {
-        scanPoints = null;
-        return;
-      }
-      scanPoints = new Float32Array(j.points);
-    } catch {
-      // ignore network errors; keep last scan
-    } finally {
-      scanReqInFlight = false;
+  try {
+    const url = `/api/v1/scan_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      return;
     }
-  })();
+    const j = (await r.json()) as ScanAtResponse;
+    if (!j || !Array.isArray(j.points) || j.count <= 0) {
+      scanPoints = null;
+      return;
+    }
+    scanPoints = new Float32Array(j.points);
+  } catch {
+    // ignore network errors; keep last scan
+  } finally {
+    scanReqInFlight = false;
+  }
+}
+
+async function requestPlanAtAbs(absT: number): Promise<void> {
+  if (!isBagMode || t0 == null || !showPlan) return;
+  if (planReqInFlight) return;
+
+  planReqInFlight = true;
+  lastPlanReqAbsT = absT;
+
+  try {
+    const url = `/api/v1/plan_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      planPath = null;
+      return;
+    }
+    const j = (await r.json()) as PlanResponse;
+    planPath = j.poses;
+  } catch {
+    // ignore
+  } finally {
+    planReqInFlight = false;
+  }
+}
+
+async function requestGoalAtAbs(absT: number): Promise<void> {
+  if (!isBagMode || t0 == null || !showGoal) return;
+  if (goalReqInFlight) return;
+
+  goalReqInFlight = true;
+  lastGoalReqAbsT = absT;
+
+  try {
+    const url = `/api/v1/goal_at?t=${encodeURIComponent(absT.toFixed(3))}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      goalPose = null;
+      return;
+    }
+    const j = (await r.json()) as GoalResponse;
+    goalPose = { x: j.x, y: j.y, yaw: j.yaw };
+  } catch {
+    // ignore
+  } finally {
+    goalReqInFlight = false;
+  }
 }
 
 // ==============================
@@ -1023,12 +1315,24 @@ async function startBagReplay(name: string): Promise<void> {
   if (t0 != null) {
     const absEnd = t0 + dur;
     requestScanAtAbs(absEnd);
+    requestPlanAtAbs(absEnd);
+    requestGoalAtAbs(absEnd);
     if (cmdOverlayEnabled) requestCmdStatsAtAbs(absEnd);
   }
+
+  // Fetch robot description (URDF)
+  void fetchRobotDescription();
 }
 
 // ==============================
-// Play/Pause (bag) — progressive refine at ~25Hz
+
+function world2screen(x: number, y: number): [number, number] {
+  const X = zoomTransform.applyX(x);
+  const Y = zoomTransform.applyY(-y); // +y up
+  return [X, Y];
+}
+
+// 50% path marker (bag) — progressive refine at ~25Hz
 // ==============================
 function startPlayback(): void {
   if (!isBagMode || isPlaying) return;
@@ -1040,49 +1344,33 @@ function startPlayback(): void {
   const relNow = Number(slider!.value) || 0;
   lastAbsTForDelta = (t0 ?? 0) + relNow;
 
-  // Drive delta requests at ~UI rate (25Hz)
-  if (!mapPlayTimer) {
-    mapPlayTimer = window.setInterval(async () => {
-      if (!isPlaying || !isBagMode || t0 == null) return;
-      const rel = Number(slider!.value) || 0;
-      const targetAbs = t0 + rel;
-      if (targetAbs > (lastAbsTForDelta ?? targetAbs) + 1e-4) {
-        await fetchMapDeltaBetween(lastAbsTForDelta!, targetAbs);
-        lastAbsTForDelta = targetAbs;
-      }
-      requestScanAtAbs(targetAbs);
-      if (cmdOverlayEnabled) requestCmdStatsAtAbs(targetAbs);
-
-      // Fetch costmaps occasionally (e.g. every 1s or if moved significantly?)
-      // For now, let's just fetch them if we have bandwidth, or maybe throttle?
-      // Let's try fetching every time for now to see if it works, but maybe check if busy?
-      // Actually, let's just call it. The browser limits parallel requests anyway.
-      void fetchCostmapsAtRel(rel);
-    }, 1000 / 25);
-  }
-
-  requestAnimationFrame(playTick);
+  // Start the synchronized loop
+  void playLoop();
 }
 
 function stopPlayback(): void {
   isPlaying = false;
   lastTickTs = null;
   if (playBtn) playBtn.textContent = "Play";
-  if (mapPlayTimer) {
-    clearInterval(mapPlayTimer);
-    mapPlayTimer = null;
-  }
 }
 
-function playTick(ts: number): void {
-  if (!isPlaying) return;
+async function playLoop(): Promise<void> {
+  if (!isPlaying || !isBagMode || t0 == null) return;
+
+  const now = performance.now();
   if (lastTickTs == null) {
-    lastTickTs = ts;
-    requestAnimationFrame(playTick);
-    return;
+    lastTickTs = now;
   }
-  const dt = (ts - lastTickTs) / 1000;
-  lastTickTs = ts;
+
+  // Calculate dt, but clamp it to avoid huge jumps if fetching takes long
+  // We want to advance time by actual elapsed time, but if the loop is slow,
+  // we effectively slow down playback.
+  // Let's say we target real-time.
+  let dt = (now - lastTickTs) / 1000;
+  lastTickTs = now;
+
+  // Cap dt to e.g. 0.1s to prevent skipping too much if we lagged
+  if (dt > 0.1) dt = 0.1;
 
   const dur = getDuration();
   let rel = Number(slider!.value) || 0;
@@ -1093,12 +1381,50 @@ function playTick(ts: number): void {
     updateTimeUI(rel);
     scrubTime = (t0 ?? 0) + rel;
     scrubPose = getBagPoseAtRel(rel);
+
+    // Final fetch at end
+    const absT = (t0 ?? 0) + rel;
+    await Promise.all([
+      fetchMapDeltaBetween(lastAbsTForDelta!, absT),
+      requestScanAtAbs(absT),
+      requestPlanAtAbs(absT),
+      requestGoalAtAbs(absT),
+      cmdOverlayEnabled ? requestCmdStatsAtAbs(absT) : Promise.resolve(),
+      fetchCostmapsAtRel(rel)
+    ]);
+
     stopPlayback();
-  } else {
-    updateTimeUI(rel);
-    scrubTime = (t0 ?? 0) + rel;
-    scrubPose = getBagPoseAtRel(rel);
-    requestAnimationFrame(playTick);
+    return;
+  }
+
+  updateTimeUI(rel);
+  scrubTime = (t0 ?? 0) + rel;
+  scrubPose = getBagPoseAtRel(rel);
+
+  const absT = (t0 ?? 0) + rel;
+
+  // Synchronized fetch: wait for ALL data before proceeding to next frame
+  await Promise.all([
+    fetchMapDeltaBetween(lastAbsTForDelta!, absT),
+    requestScanAtAbs(absT),
+    requestPlanAtAbs(absT),
+    requestGoalAtAbs(absT),
+    cmdOverlayEnabled ? requestCmdStatsAtAbs(absT) : Promise.resolve(),
+    fetchCostmapsAtRel(rel)
+  ]);
+
+  lastAbsTForDelta = absT;
+
+  // Schedule next iteration immediately
+  if (isPlaying) {
+    // We use setTimeout(..., 0) or just call recursively?
+    // Recursive call might stack overflow if not careful, but async function returns Promise, so it's fine.
+    // Better to use requestAnimationFrame to yield to UI thread, 
+    // but we want to drive this as fast as possible (or as slow as needed).
+    // requestAnimationFrame might be too fast if we just did a heavy fetch?
+    // No, requestAnimationFrame is good for rendering.
+    // Actually, we just finished a heavy fetch. We should let the browser render.
+    requestAnimationFrame(() => void playLoop());
   }
 }
 
@@ -1217,6 +1543,8 @@ slider!.addEventListener("input", () => {
   scrubPose = poseAt(scrubTime);
   if (isBagMode && scrubTime != null) {
     requestScanAtAbs(scrubTime);
+    requestPlanAtAbs(scrubTime);
+    requestGoalAtAbs(scrubTime);
     if (cmdOverlayEnabled) requestCmdStatsAtAbs(scrubTime);
   }
 });
@@ -1230,6 +1558,8 @@ slider!.addEventListener("change", async () => {
   const absT = t0 + rel;
   lastAbsTForDelta = absT; // resync delta base to playhead
   requestScanAtAbs(absT);
+  requestPlanAtAbs(absT);
+  requestGoalAtAbs(absT);
   if (cmdOverlayEnabled) requestCmdStatsAtAbs(absT);
 });
 
@@ -1271,6 +1601,28 @@ if (toggleLidar) {
     showLidar = toggleLidar.checked;
   });
 }
+if (togglePlan) {
+  togglePlan.addEventListener("change", () => {
+    showPlan = togglePlan.checked;
+    if (showPlan && isBagMode && t0 != null) {
+      const rel = Number(slider!.value) || 0;
+      requestPlanAtAbs(t0 + rel);
+    } else if (!showPlan) {
+      planPath = null;
+    }
+  });
+}
+if (toggleGoal) {
+  toggleGoal.addEventListener("change", () => {
+    showGoal = toggleGoal.checked;
+    if (showGoal && isBagMode && t0 != null) {
+      const rel = Number(slider!.value) || 0;
+      requestGoalAtAbs(t0 + rel);
+    } else if (!showGoal) {
+      goalPose = null;
+    }
+  });
+}
 if (toggleCmdOverlay) {
   toggleCmdOverlay.addEventListener("change", () => {
     const next = toggleCmdOverlay.checked;
@@ -1304,32 +1656,366 @@ setTimeout(async () => {
   } catch {
     /* ignore */
   }
+  // Try to fetch robot description on startup (for live mode or if bag already has it)
+  void fetchRobotDescription();
 }, 1500);
 
 // ==============================
-// Rendering
-// ==============================
-function world2screen(x: number, y: number): [number, number] {
-  const X = zoomTransform.applyX(x);
-  const Y = zoomTransform.applyY(-y); // +y up
-  return [X, Y];
+
+// ... (RobotShape and robotDims remain same)
+
+// ... (fetchRobotDescription remains same)
+
+// ... (loadPoseHistoryOnce remains same)
+
+function updateHalfwayPoint(currentPose: { x: number; y: number }): void {
+  if (!poseHist.length || t0 == null || !poseHistDist) return;
+
+  const rel = Number(slider!.value) || 0;
+  const absT = t0 + rel;
+
+  // 1. Calculate History Distance
+  let idx = 0;
+  while (idx < poseHist.length && poseHist[idx].t <= absT) {
+    idx++;
+  }
+  const lastIdx = Math.max(0, idx - 1);
+
+  let distHistory = poseHistDist[lastIdx];
+  const dx = currentPose.x - poseHist[lastIdx].x;
+  const dy = currentPose.y - poseHist[lastIdx].y;
+  distHistory += Math.sqrt(dx * dx + dy * dy);
+
+  // 2. Calculate Plan Distance
+  let distPlan = 0;
+  if (planPath && planPath.length > 0) {
+    const dx0 = planPath[0][0] - currentPose.x;
+    const dy0 = planPath[0][1] - currentPose.y;
+    distPlan += Math.sqrt(dx0 * dx0 + dy0 * dy0);
+
+    for (let i = 1; i < planPath.length; i++) {
+      const dx = planPath[i][0] - planPath[i - 1][0];
+      const dy = planPath[i][1] - planPath[i - 1][1];
+      distPlan += Math.sqrt(dx * dx + dy * dy);
+    }
+  }
+
+  // 3. Total Estimated Distance
+  const totalDist = distHistory + distPlan;
+
+  // Prevent premature triggering:
+  // If not fixed yet, require a valid plan and min distance
+  if (!fixedHalfway) {
+    if (!planPath || planPath.length === 0) {
+      halfwayPoint = null;
+      halfwayT = null;
+      return;
+    }
+    if (totalDist < 1.0) {
+      halfwayPoint = null;
+      halfwayT = null;
+      return;
+    }
+  }
+
+  const targetDist = totalDist * 0.5;
+
+  // 4. Determine Reached Status & Calculate Candidate Point
+  let candidatePoint: { x: number, y: number, reached: boolean } | null = null;
+  let candidateT: { t: number, reached: boolean } | null = null;
+  const isReached = targetDist <= distHistory;
+
+  if (isReached) {
+    // It's in history
+    let k = 0;
+    while (k < lastIdx && poseHistDist[k + 1] <= targetDist) {
+      k++;
+    }
+
+    if (k < lastIdx) {
+      const dStart = poseHistDist[k];
+      const dEnd = poseHistDist[k + 1];
+      const ratio = (targetDist - dStart) / (dEnd - dStart);
+      candidatePoint = {
+        x: poseHist[k].x + (poseHist[k + 1].x - poseHist[k].x) * ratio,
+        y: poseHist[k].y + (poseHist[k + 1].y - poseHist[k].y) * ratio,
+        reached: true
+      };
+    } else {
+      const dStart = poseHistDist[lastIdx];
+      const dEnd = distHistory;
+      const ratio = (targetDist - dStart) / Math.max(1e-6, dEnd - dStart);
+      candidatePoint = {
+        x: poseHist[lastIdx].x + (currentPose.x - poseHist[lastIdx].x) * ratio,
+        y: poseHist[lastIdx].y + (currentPose.y - poseHist[lastIdx].y) * ratio,
+        reached: true
+      };
+    }
+
+    // Calculate T for reached point
+    // Search targetDist in FULL poseHistDist
+    let m = 0;
+    if (poseHistDist[poseHistDist.length - 1] < targetDist) {
+      candidateT = null; // Should not happen if reached is true based on current history
+    } else {
+      while (m < poseHistDist.length - 1 && poseHistDist[m + 1] <= targetDist) {
+        m++;
+      }
+      const dStart = poseHistDist[m];
+      const dEnd = poseHistDist[m + 1];
+      const ratio = (targetDist - dStart) / Math.max(1e-6, dEnd - dStart);
+      const tInterp = poseHist[m].t + (poseHist[m + 1].t - poseHist[m].t) * ratio;
+      candidateT = { t: tInterp, reached: true };
+    }
+
+  } else {
+    // It's in plan (Future)
+    let d = distHistory;
+    if (planPath && planPath.length > 0) {
+      const dx0 = planPath[0][0] - currentPose.x;
+      const dy0 = planPath[0][1] - currentPose.y;
+      const segLen0 = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+
+      if (d + segLen0 >= targetDist) {
+        const remain = targetDist - d;
+        const ratio = remain / segLen0;
+        candidatePoint = {
+          x: currentPose.x + dx0 * ratio,
+          y: currentPose.y + dy0 * ratio,
+          reached: false
+        };
+      } else {
+        d += segLen0;
+        let found = false;
+        for (let i = 1; i < planPath.length; i++) {
+          const dx = planPath[i][0] - planPath[i - 1][0];
+          const dy = planPath[i][1] - planPath[i - 1][1];
+          const segLen = Math.sqrt(dx * dx + dy * dy);
+          if (d + segLen >= targetDist) {
+            const remain = targetDist - d;
+            const ratio = remain / segLen;
+            candidatePoint = {
+              x: planPath[i - 1][0] + dx * ratio,
+              y: planPath[i - 1][1] + dy * ratio,
+              reached: false
+            };
+            found = true;
+            break;
+          }
+          d += segLen;
+        }
+        if (!found) candidatePoint = null;
+      }
+    } else {
+      candidatePoint = null;
+    }
+
+    // Future T is unknown/not in bag
+    candidateT = null;
+  }
+
+  // 5. Fixed Marker Logic
+  // If we scrubbed back before the fixed point, reset it
+  if (fixedHalfway && absT < fixedHalfway.t) {
+    fixedHalfway = null;
+  }
+
+  // If we have a fixed marker, use it
+  if (fixedHalfway) {
+    halfwayPoint = { x: fixedHalfway.x, y: fixedHalfway.y, reached: true };
+    halfwayT = { t: fixedHalfway.t, reached: true };
+  } else {
+    // Use calculated candidate
+    halfwayPoint = candidatePoint;
+    halfwayT = candidateT;
+
+    // If we just reached it, fix it!
+    if (halfwayPoint && halfwayPoint.reached && halfwayT) {
+      fixedHalfway = { t: halfwayT.t, x: halfwayPoint.x, y: halfwayPoint.y };
+    }
+  }
+
+  // 6. Visibility Logic
+  // Show if: (Reached/Fixed) OR (Plan Exists)
+  const show = (halfwayPoint && halfwayPoint.reached) || (planPath && planPath.length > 0);
+
+  if (!show) {
+    halfwayPoint = null;
+    halfwayT = null;
+  }
+
+  updateTimelineMarker();
+}
+
+function updateTimelineMarker(): void {
+  let marker = document.getElementById("halfwayMarker");
+  if (!marker) {
+    marker = document.createElement("div");
+    marker.id = "halfwayMarker";
+    marker.style.position = "absolute";
+    marker.style.width = "4px";
+    marker.style.height = "16px"; // Taller than slider track
+    marker.style.top = "22px"; // Center vertically over slider roughly
+    marker.style.pointerEvents = "none";
+    marker.style.zIndex = "10";
+    marker.style.borderRadius = "2px";
+
+    const container = document.getElementById("timeControls");
+    if (container) {
+      container.style.position = "relative";
+      container.appendChild(marker);
+    }
+  }
+
+  const dur = getDuration();
+  // Show only if we have a valid time in the past (t > 0) and it's within range
+  if (halfwayT && halfwayT.t > 0 && t0 != null && dur > 0) {
+    const relT = halfwayT.t - t0;
+    // Clamp to 0..dur just in case
+    if (relT >= 0 && relT <= dur) {
+      // Color based on reached status
+      marker.style.backgroundColor = halfwayT.reached ? "#3b82f6" : "#9ca3af"; // Blue-500 vs Gray-400
+
+      // Try to get slider's bounding rect relative to container
+      const sliderEl = document.getElementById("timeSlider");
+      const container = document.getElementById("timeControls");
+      if (sliderEl && container) {
+        const sRect = sliderEl.getBoundingClientRect();
+        const cRect = container.getBoundingClientRect();
+        const leftOffset = sRect.left - cRect.left;
+        const width = sRect.width;
+
+        // thumb width correction (approx 16px)
+        const thumbW = 16;
+        const trackW = width - thumbW;
+        const px = leftOffset + (thumbW / 2) + (relT / dur) * trackW;
+
+        marker.style.left = `${px}px`;
+        marker.style.top = `${(sRect.top - cRect.top) + (sRect.height / 2) - 8}px`; // Center vertically
+        marker.style.display = "block";
+        return;
+      }
+    }
+  }
+  if (marker) marker.style.display = "none";
 }
 
 function drawRobot(xm: number, ym: number, yaw: number, color = "#f59e0b"): void {
   const [x, y] = world2screen(xm, ym);
-  const size = Math.max(8, 12 * (zoomTransform.k / 40) * 1.6);
+
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(-yaw);
-  ctx.beginPath();
-  ctx.moveTo(size, 0);
-  ctx.lineTo(-size * 0.6, size * 0.5);
-  ctx.lineTo(-size * 0.6, -size * 0.5);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
+
+  if (robotDims) {
+    const k = zoomTransform.k;
+
+    if (robotDims.type === "a300") {
+      // Dimensions
+      const chassisL = robotDims.length * k;
+      const chassisW = robotDims.width * k;
+      const wheelBase = (robotDims.wheel_base || 0.512) * k;
+      const wheelTrack = (robotDims.wheel_track || 0.562) * k;
+      const wheelRad = (robotDims.wheel_radius || 0.1651) * k;
+      const wheelW = (robotDims.wheel_width || 0.1143) * k;
+      const wheelDiam = wheelRad * 2;
+
+      // Colors
+      const colChassis = "#f59e0b"; // Husky Yellow
+      const colDark = "#333333";    // Dark Grey/Black
+      const colBumper = "#1f2937";  // Darker Grey
+
+      // 1. Suspension Beams (connects wheels on each side)
+      // Approx size: length = wheelBase, width = small
+      const beamW = 0.05 * k;
+      ctx.fillStyle = colDark;
+      // Left Beam
+      ctx.fillRect(-wheelBase / 2, wheelTrack / 2 - beamW / 2, wheelBase, beamW);
+      // Right Beam
+      ctx.fillRect(-wheelBase / 2, -wheelTrack / 2 - beamW / 2, wheelBase, beamW);
+
+      // 2. Wheels
+      ctx.fillStyle = colDark;
+      // Front Left
+      ctx.fillRect(wheelBase / 2 - wheelDiam / 2, wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+      // Front Right
+      ctx.fillRect(wheelBase / 2 - wheelDiam / 2, -wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+      // Rear Left
+      ctx.fillRect(-wheelBase / 2 - wheelDiam / 2, wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+      // Rear Right
+      ctx.fillRect(-wheelBase / 2 - wheelDiam / 2, -wheelTrack / 2 - wheelW / 2, wheelDiam, wheelW);
+
+      // 3. Chassis Body
+      ctx.fillStyle = colChassis;
+      ctx.fillRect(-chassisL / 2, -chassisW / 2, chassisL, chassisW);
+
+      // 4. Bumpers (Front and Rear)
+      // Approx size: slightly wider than chassis, thin
+      const bumperDepth = 0.05 * k;
+      const bumperWidth = chassisW + 0.02 * k;
+      ctx.fillStyle = colBumper;
+
+      // Front Bumper
+      ctx.fillRect(chassisL / 2, -bumperWidth / 2, bumperDepth, bumperWidth);
+      // Rear Bumper
+      ctx.fillRect(-chassisL / 2 - bumperDepth, -bumperWidth / 2, bumperDepth, bumperWidth);
+
+      // 5. Direction Indicator / Top Plate details
+      // Draw a "front" indicator on the chassis
+      ctx.fillStyle = "rgba(0,0,0,0.2)";
+      ctx.fillRect(chassisL * 0.1, -chassisW * 0.3, chassisL * 0.3, chassisW * 0.6); // "Top plate" area
+
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.moveTo(chassisL * 0.3, 0);
+      ctx.lineTo(chassisL * 0.45, 0);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Arrow head
+      ctx.beginPath();
+      ctx.moveTo(chassisL * 0.45, 0);
+      ctx.lineTo(chassisL * 0.4, chassisW * 0.05);
+      ctx.lineTo(chassisL * 0.4, -chassisW * 0.05);
+      ctx.fill();
+
+    } else {
+      // Render based on URDF dimensions (Box/Cylinder)
+      const wPx = robotDims.width * k;
+      const lPx = robotDims.length * k;
+
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      if (robotDims.type === "cylinder") {
+        ctx.arc(0, 0, wPx / 2, 0, Math.PI * 2);
+      } else {
+        ctx.rect(-lPx / 2, -wPx / 2, lPx, wPx);
+      }
+      ctx.fill();
+
+      // Direction indicator
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.moveTo(lPx / 4, 0);
+      ctx.lineTo(lPx / 2, 0);
+      ctx.stroke();
+    }
+
+  } else {
+    // Fallback: Triangle
+    const size = Math.max(8, 12 * (zoomTransform.k / 40) * 1.6);
+    ctx.beginPath();
+    ctx.moveTo(size, 0);
+    ctx.lineTo(-size * 0.6, size * 0.5);
+    ctx.lineTo(-size * 0.6, -size * 0.5);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
   ctx.restore();
 }
+
 
 function drawGrid(stepMeters: number, color: string): void {
   const k = zoomTransform.k;
@@ -1392,64 +2078,209 @@ function drawLidar(): void {
   ctx.restore();
 }
 
-function draw(): void {
+function drawPlan(): void {
+  if (!planPath || planPath.length < 2) return;
+
   ctx.save();
-  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = "#00ff00"; // Green for plan
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 5]); // Dashed line
 
-  const invX0 = zoomTransform.invertX(0);
-  const invX1 = zoomTransform.invertX(W);
-  const invY0 = zoomTransform.invertY(0);
-  const invY1 = zoomTransform.invertY(H);
-  const viewport = {
-    xMin: Math.min(invX0, invX1),
-    xMax: Math.max(invX0, invX1),
-    yMin: -Math.max(invY0, invY1),
-    yMax: -Math.min(invY0, invY1),
-  };
-
-  if (mapLayer) mapLayer.draw(ctx, world2screen, viewport);
-  if (showGlobalCostmap && globalCostmapLayer) globalCostmapLayer.draw(ctx, world2screen, viewport);
-  if (showLocalCostmap && localCostmapLayer) localCostmapLayer.draw(ctx, world2screen, viewport);
-
-  drawGrid(1.0, "rgba(0, 0, 0, 0.08)");
-  drawGrid(0.25, "rgba(0, 0, 0, 0.035)");
-
-  // Lidar scan (on top of map/grid)
-  if (showLidar) drawLidar();
-
-  if (path.length > 1) {
-    ctx.beginPath();
-    for (let i = 0; i < path.length; i++) {
-      const [x, y] = world2screen(path[i][0], path[i][1]);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = "#60a5fa";
-    ctx.stroke();
+  ctx.beginPath();
+  for (let i = 0; i < planPath.length; i++) {
+    const [x, y] = world2screen(planPath[i][0], planPath[i][1]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   }
+  ctx.stroke();
 
-  // Which pose to render
-  let renderPose: { x: number; y: number; yaw: number };
-  if (isBagMode) {
-    const rel = Number(slider!.value) || 0;
-    renderPose = (scrubPose || getBagPoseAtRel(rel)) as { x: number; y: number; yaw: number };
-  } else {
-    renderPose = liveMode ? pose : (scrubPose || pose)!;
-  }
-  drawRobot(renderPose.x, renderPose.y, renderPose.yaw, "#f59e0b");
+  // Draw a small marker at the end of the plan
+  const last = planPath[planPath.length - 1];
+  const [lx, ly] = world2screen(last[0], last[1]);
+  const size = Math.max(4, 6 * (zoomTransform.k / 40));
 
-  // Loading shimmer while fetching map snapshot
-  if (isMapLoading) {
-    ctx.fillStyle = "rgba(96,165,250,0.08)";
-    ctx.fillRect(0, 0, W, H);
-  }
+  ctx.setLineDash([]); // Solid line for marker
+  ctx.fillStyle = "#00ff00";
+  ctx.beginPath();
+  ctx.arc(lx, ly, size, 0, Math.PI * 2);
+  ctx.fill();
 
   ctx.restore();
-
-  // Draw cmd_vel mini overlay canvas (separate canvas)
-  drawCmdOverlayMini();
-
-  requestAnimationFrame(draw);
 }
+
+function drawGoal(): void {
+  if (!goalPose) return;
+
+  const [x, y] = world2screen(goalPose.x, goalPose.y);
+  const size = Math.max(10, 15 * (zoomTransform.k / 40));
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-goalPose.yaw);
+
+  // Draw a target marker (circle with crosshair) or arrow
+  // Let's draw a distinct arrow (Cyan)
+  ctx.fillStyle = "#00ffff";
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size * 0.5, size * 0.5);
+  ctx.lineTo(-size * 0.5, -size * 0.5);
+  ctx.closePath();
+  ctx.fill();
+
+  // Add a ring
+  ctx.strokeStyle = "#00ffff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, size * 1.2, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function draw(): void {
+  try {
+    ctx.save();
+    ctx.clearRect(0, 0, W, H);
+
+    const invX0 = zoomTransform.invertX(0);
+    const invX1 = zoomTransform.invertX(W);
+    const invY0 = zoomTransform.invertY(0);
+    const invY1 = zoomTransform.invertY(H);
+    const viewport = {
+      xMin: Math.min(invX0, invX1),
+      xMax: Math.max(invX0, invX1),
+      yMin: -Math.max(invY0, invY1),
+      yMax: -Math.min(invY0, invY1),
+    };
+
+    if (mapLayer) mapLayer.draw(ctx, world2screen, viewport);
+    if (showGlobalCostmap && globalCostmapLayer) globalCostmapLayer.draw(ctx, world2screen, viewport);
+    if (showLocalCostmap && localCostmapLayer) localCostmapLayer.draw(ctx, world2screen, viewport);
+
+    drawGrid(1.0, "rgba(0, 0, 0, 0.08)");
+    drawGrid(0.25, "rgba(0, 0, 0, 0.035)");
+
+    // Lidar scan (on top of map/grid)
+    if (showLidar) drawLidar();
+    if (showPlan) drawPlan();
+    if (showGoal) drawGoal();
+
+    // Which pose to render
+    let renderPose: { x: number; y: number; yaw: number };
+    if (isBagMode) {
+      const rel = Number(slider!.value) || 0;
+      renderPose = (scrubPose || getBagPoseAtRel(rel)) as { x: number; y: number; yaw: number };
+    } else {
+      renderPose = liveMode ? pose : (scrubPose || pose)!;
+    }
+
+    // Draw Path
+    // Bag mode: reconstruct from poseHist up to current time
+    // Live mode: use accumulated 'path' array
+    if (isBagMode && poseHist.length && t0 != null) {
+      const rel = Number(slider!.value) || 0;
+      const absT = t0 + rel;
+
+      ctx.beginPath();
+      let started = false;
+      let lastX = -99999, lastY = -99999;
+      const minSq = 0.05 * 0.05; // 5cm threshold
+
+      for (const p of poseHist) {
+        if (p.t > absT) break;
+
+        const dx = p.x - lastX;
+        const dy = p.y - lastY;
+        if (dx * dx + dy * dy < minSq) continue;
+
+        const [sx, sy] = world2screen(p.x, p.y);
+        if (!started) {
+          ctx.moveTo(sx, sy);
+          started = true;
+        } else {
+          ctx.lineTo(sx, sy);
+        }
+        lastX = p.x;
+        lastY = p.y;
+      }
+
+      // Connect to current interpolated robot pose
+      if (started) {
+        const [sx, sy] = world2screen(renderPose.x, renderPose.y);
+        ctx.lineTo(sx, sy);
+      } else if (poseHist.length > 0 && poseHist[0].t <= absT) {
+        // If we didn't start (maybe only 1 point or all filtered), just draw to robot
+        const [sx, sy] = world2screen(poseHist[0].x, poseHist[0].y);
+        ctx.moveTo(sx, sy);
+        const [ex, ey] = world2screen(renderPose.x, renderPose.y);
+        ctx.lineTo(ex, ey);
+      }
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#60a5fa"; // Blue-ish
+      ctx.stroke();
+
+    } else if (path.length > 1) {
+      ctx.beginPath();
+      for (let i = 0; i < path.length; i++) {
+        const [x, y] = world2screen(path[i][0], path[i][1]);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "#60a5fa";
+      ctx.stroke();
+    }
+    drawRobot(renderPose.x, renderPose.y, renderPose.yaw, "#f59e0b");
+
+    // Calculate dynamic halfway point (History + Plan)
+    updateHalfwayPoint(renderPose);
+
+    // Draw 50% marker if available
+    if (isBagMode && halfwayPoint) {
+      const [hx, hy] = world2screen(halfwayPoint.x, halfwayPoint.y);
+      const size = Math.max(6, 8 * (zoomTransform.k / 40));
+
+      ctx.save();
+      // Color based on reached status
+      const color = halfwayPoint.reached ? "#3b82f6" : "#9ca3af"; // Blue-500 vs Gray-400
+      ctx.fillStyle = color;
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+
+      // Draw pin/circle
+      ctx.beginPath();
+      ctx.arc(hx, hy, size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Label
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 12px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("Est. 50%", hx, hy - size - 2);
+
+      ctx.restore();
+    }
+
+    // Loading shimmer while fetching map snapshot
+    if (isMapLoading) {
+      ctx.fillStyle = "rgba(96,165,250,0.08)";
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    ctx.restore();
+
+    // Draw cmd_vel mini overlay canvas (separate canvas)
+    drawCmdOverlayMini();
+
+    requestAnimationFrame(draw);
+  } catch (e) {
+    console.error("Draw loop error:", e);
+    setStatus("Draw error: " + String(e));
+  }
+}
+
 requestAnimationFrame(draw);

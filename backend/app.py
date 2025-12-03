@@ -18,7 +18,10 @@ from .models import (
     MapFullAtResponse,
     MapDeltaResponse,
     ScanAtResponse,
+    ScanAtResponse,
     CmdStatsResponse,
+    PlanResponse,
+    GoalResponse,
 )
 from .services.pose_service import (
     get_pose_history_service,
@@ -234,6 +237,57 @@ async def cmd_stats_at(
 ):
     core = get_core()
     return get_cmd_stats_at_service(core, t)
+
+
+# ---------------------- REST: Plan/Goal (bag mode) ------
+@app.get("/api/v1/plan_at", response_model=PlanResponse)
+async def plan_at(
+    t: float = Query(..., description="Absolute bag time (seconds)"),
+):
+    core = get_core()
+    with core.lock:
+        idx = getattr(core, "_bag_plan_index", None)
+    
+    if idx is None:
+        return JSONResponse(status_code=404, content={"error": "no plan index"})
+    
+    poses = idx.nearest(t)
+    if poses is None:
+        return JSONResponse(status_code=404, content={"error": "no plan found"})
+    
+    # poses is list of (x, y)
+    return PlanResponse(t=t, poses=[[p[0], p[1]] for p in poses])
+
+
+@app.get("/api/v1/goal_at", response_model=GoalResponse)
+async def goal_at(
+    t: float = Query(..., description="Absolute bag time (seconds)"),
+):
+    core = get_core()
+    with core.lock:
+        idx = getattr(core, "_bag_goal_index", None)
+    
+    if idx is None:
+        return JSONResponse(status_code=404, content={"error": "no goal index"})
+    
+    # latest_at returns (x, y, yaw)
+    res = idx.latest_at(t)
+    if res is None:
+        return JSONResponse(status_code=404, content={"error": "no goal found"})
+    
+    return GoalResponse(t=t, x=res[0], y=res[1], yaw=res[2])
+
+
+@app.get("/api/v1/robot_description")
+async def robot_description():
+    core = get_core()
+    with core.lock:
+        desc = getattr(core, "robot_description", None)
+    
+    if desc is None:
+        return JSONResponse(status_code=404, content={"error": "no robot description found"})
+    
+    return {"urdf": desc}
 
 
 # ---------------------- REST: Bag files -----------------

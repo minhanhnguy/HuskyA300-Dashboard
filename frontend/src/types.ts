@@ -22,14 +22,14 @@ export interface PoseHistoryMeta { count: number; t0: number; t1: number; }
 
 // WS: path stream
 export type PathWSMessage =
-  | { type: "snapshot"; path: [number, number][]; pose: {x:number;y:number;yaw:number}; v:number; w:number; }
-  | { type: "append"; append: [number, number][]; pose: {x:number;y:number;yaw:number}; };
+  | { type: "snapshot"; path: [number, number][]; pose: { x: number; y: number; yaw: number }; v: number; w: number; }
+  | { type: "append"; append: [number, number][]; pose: { x: number; y: number; yaw: number }; };
 
 // WS: map stream (live)
 export type MapWSMessage =
   | { type: "map_meta"; meta: MapMeta }
   | { type: "map_full"; version: number; data: number[] }
-  | { type: "map_updates"; updates: { x:number;y:number;w:number;h:number;data:number[] }[] };
+  | { type: "map_updates"; updates: { x: number; y: number; w: number; h: number; data: number[] }[] };
 
 // Lidar scan (bag mode)
 export interface ScanAtResponse {
@@ -56,6 +56,9 @@ export interface CmdPrefixStats {
   sample_count: number;
   max_vx_forward: number;
   max_vx_reverse: number;
+  avg_vx: number;
+  max_vy_abs: number;
+  avg_vy_abs: number;
   max_wz_abs: number;
   has_lateral: boolean;
   has_ang_xy: boolean;
@@ -66,4 +69,17 @@ export interface CmdStatsResponse {
   prefix?: CmdPrefixStats | null;
   bag_t0?: number | null;
   bag_t1?: number | null;
+}
+
+// Plan and Goal (bag mode)
+export interface PlanResponse {
+  t: number;
+  poses: [number, number][]; // list of [x, y]
+}
+
+export interface GoalResponse {
+  t: number;
+  x: number;
+  y: number;
+  yaw: number;
 }

@@ -11,6 +11,7 @@ import numpy as np
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 import rosbag2_py
+from std_msgs.msg import String as StringMsg
 
 from . import config as C
 
@@ -290,6 +291,10 @@ class _BagCmdIndex:
         self.has_lateral_prefix: List[bool] = []
         self.has_ang_xy_prefix: List[bool] = []
 
+        self.avg_vx_prefix: List[float] = []
+        self.max_vy_abs_prefix: List[float] = []
+        self.avg_vy_abs_prefix: List[float] = []
+
         # overall cmd_vel span in bag time
         self.bag_t0: Optional[float] = None
         self.bag_t1: Optional[float] = None
@@ -327,11 +332,20 @@ class _BagCmdIndex:
         self.has_lateral_prefix = [False] * n
         self.has_ang_xy_prefix = [False] * n
 
+        self.avg_vx_prefix = [0.0] * n
+        self.max_vy_abs_prefix = [0.0] * n
+        self.avg_vy_abs_prefix = [0.0] * n
+
         max_fwd = 0.0
         max_rev = 0.0  # most negative vx observed (reverse)
         max_wz_abs = 0.0
         has_lat = False
         has_ang_xy = False
+        
+        sum_vx = 0.0
+        max_vy_abs = 0.0
+        sum_vy_abs = 0.0
+        
         EPS = 1e-6
 
         for i, (t, vx, vy, vz, wx, wy, wz) in enumerate(self._samples):
@@ -355,11 +369,23 @@ class _BagCmdIndex:
             if abs(wx) > EPS or abs(wy) > EPS:
                 has_ang_xy = True
 
+            # New stats
+            sum_vx += vx
+            vy_abs = abs(vy)
+            if vy_abs > max_vy_abs:
+                max_vy_abs = vy_abs
+            sum_vy_abs += vy_abs
+            
+            count = i + 1
             self.max_vx_forward_prefix[i] = max_fwd
             self.max_vx_reverse_prefix[i] = max_rev
             self.max_wz_abs_prefix[i] = max_wz_abs
             self.has_lateral_prefix[i] = has_lat
             self.has_ang_xy_prefix[i] = has_ang_xy
+            
+            self.avg_vx_prefix[i] = sum_vx / count
+            self.max_vy_abs_prefix[i] = max_vy_abs
+            self.avg_vy_abs_prefix[i] = sum_vy_abs / count
 
         self.bag_t0 = self.times[0]
         self.bag_t1 = self.times[-1]
@@ -388,6 +414,80 @@ class _BagCmdIndex:
                 hi = mid - 1
         return lo
 
+# ----------------- Plan/Goal timeline helpers -----------------
+
+
+class _BagPlanIndex:
+    """
+    Time-indexed path (nav_msgs/Path).
+    """
+
+    def __init__(self):
+        self._plans: List[Tuple[float, List[Tuple[float, float]]]] = []
+
+    def add(self, t: float, poses: List[Tuple[float, float]]):
+        self._plans.append((t, poses))
+
+    def finalize(self):
+        self._plans.sort(key=lambda p: p[0])
+
+    def nearest(self, t: float, tol: float = 0.5) -> Optional[List[Tuple[float, float]]]:
+        if not self._plans:
+            return None
+        # Binary search
+        lo, hi = 0, len(self._plans) - 1
+        best_idx = -1
+        best_dt = float("inf")
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            mt = self._plans[mid][0]
+            dt = abs(mt - t)
+            if dt < best_dt:
+                best_dt = dt
+                best_idx = mid
+            if mt < t:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        
+        if best_idx != -1 and best_dt <= tol:
+            return self._plans[best_idx][1]
+        return None
+
+
+class _BagGoalIndex:
+    """
+    Time-indexed goal pose (geometry_msgs/PoseStamped).
+    """
+
+    def __init__(self):
+        self._goals: List[Tuple[float, float, float, float]] = []  # t, x, y, yaw
+
+    def add(self, t: float, x: float, y: float, yaw: float):
+        self._goals.append((t, x, y, yaw))
+
+    def finalize(self):
+        self._goals.sort(key=lambda p: p[0])
+
+    def latest_at(self, t: float) -> Optional[Tuple[float, float, float]]:
+        """Return the last goal received before or at time t."""
+        if not self._goals:
+            return None
+        # Binary search for rightmost item <= t
+        lo, hi = 0, len(self._goals) - 1
+        idx = -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._goals[mid][0] <= t:
+                idx = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        
+        if idx != -1:
+            return self._goals[idx][1:] # x, y, yaw
+        return None
 
 # ----------------- public API -----------------
 
@@ -446,6 +546,12 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             scan_exact = f"{ns}/sensors/lidar2d_0/scan"
             gc_exact = f"{ns}/global_costmap/costmap"
             lc_exact = f"{ns}/local_costmap/costmap"
+            plan_exact = f"{ns}/plan"
+            goal_exact = f"{ns}/goal_pose"
+            robot_desc_topic = f"{ns}/robot_description"
+
+            # We'll just store the first robot_description we see
+            robot_description: Optional[str] = None
 
             # Msg types
             Odom = get_message("nav_msgs/msg/Odometry")
@@ -456,6 +562,7 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             Laser = get_message("sensor_msgs/msg/LaserScan")
             Twist = get_message("geometry_msgs/msg/Twist")
             TwistStamped = get_message("geometry_msgs/msg/TwistStamped")
+            PathMsg = get_message("nav_msgs/msg/Path")
 
             # Resolve topics
             def pick_exact_or_any(exact_name: str, type_suffix: str) -> Optional[str]:
@@ -523,6 +630,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             gc_topic = pick_exact_or_any(gc_exact, "nav_msgs/msg/OccupancyGrid")
             lc_topic = pick_exact_or_any(lc_exact, "nav_msgs/msg/OccupancyGrid")
 
+            # Plan/Goal topics
+            plan_topic = pick_exact_or_any(plan_exact, "nav_msgs/msg/Path")
+            goal_topic = pick_exact_or_any(goal_exact, "geometry_msgs/msg/PoseStamped")
+
             # Cmd_vel topics (Twist or TwistStamped)
             cmd_topics: List[str] = []
             for tname, ttype in topics.items():
@@ -554,6 +665,8 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             print(f"   tf*:  {tf_topics}")
             print(f"   scan: {scan_topic}")
             print(f"   cmd:  {cmd_topics}")
+            print(f"   plan: {plan_topic}")
+            print(f"   goal: {goal_topic}")
 
             # Storage
             poses_odom: List[Tuple[float, float, float, float]] = []  # (t, x_o, y_o, yaw_ob)
@@ -589,6 +702,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
 
             # Cmd_vel index
             cmd_index = _BagCmdIndex()
+
+            # Plan/Goal index
+            plan_index = _BagPlanIndex()
+            goal_index = _BagGoalIndex()
 
             # Iterate bag
             while reader.has_next():
@@ -793,12 +910,37 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                         wz = float(getattr(twist.angular, "z", 0.0))
                         cmd_index.add(t, vx, vy, vz, wx, wy, wz)
 
+                elif plan_topic and topic == plan_topic:
+                    msg = deserialize_message(raw, PathMsg)
+                    t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+                    poses = []
+                    for p in msg.poses:
+                        px = float(p.pose.position.x)
+                        py = float(p.pose.position.y)
+                        poses.append((px, py))
+                    plan_index.add(t, poses)
+
+                elif goal_topic and topic == goal_topic:
+                    msg = deserialize_message(raw, PoseSt)
+                    t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+                    px = float(msg.pose.position.x)
+                    py = float(msg.pose.position.y)
+                    yaw = _yaw_from_quat(msg.pose.orientation)
+                    goal_index.add(t, px, py, yaw)
+
+                elif robot_desc_topic and topic == robot_desc_topic:
+                    if robot_description is None:
+                        msg = deserialize_message(raw, StringMsg)
+                        robot_description = msg.data
+
             # Sort by time
             poses_odom.sort(key=lambda p: p[0])
             tf_map_odom.sort(key=lambda s: s.t)
             tf_odom_base.sort(key=lambda s: s.t)
             scan_index.finalize()
             cmd_index.finalize()
+            plan_index.finalize()
+            goal_index.finalize()
 
             # ---- Compute poses using TF odom->base (primary), with optional map->odom ----
             poses_final: List[Tuple[float, float, float, float]] = []
@@ -915,6 +1057,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 bag_cmd_prefix_has_lateral: List[bool] = list(cmd_index.has_lateral_prefix)
                 bag_cmd_prefix_has_ang_xy: List[bool] = list(cmd_index.has_ang_xy_prefix)
 
+                bag_cmd_prefix_avg_vx: List[float] = list(cmd_index.avg_vx_prefix)
+                bag_cmd_prefix_max_vy_abs: List[float] = list(cmd_index.max_vy_abs_prefix)
+                bag_cmd_prefix_avg_vy_abs: List[float] = list(cmd_index.avg_vy_abs_prefix)
+
                 bag_cmd_t0 = cmd_index.bag_t0 if cmd_index.bag_t0 is not None else cmd_index.times[0]
                 bag_cmd_t1 = cmd_index.bag_t1 if cmd_index.bag_t1 is not None else cmd_index.times[-1]
             else:
@@ -931,6 +1077,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 bag_cmd_prefix_max_wz_abs = []
                 bag_cmd_prefix_has_lateral = []
                 bag_cmd_prefix_has_ang_xy = []
+
+                bag_cmd_prefix_avg_vx = []
+                bag_cmd_prefix_max_vy_abs = []
+                bag_cmd_prefix_avg_vy_abs = []
 
                 bag_cmd_t0 = 0.0
                 bag_cmd_t1 = 0.0
@@ -983,6 +1133,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 # lidar + TF info for scan service
                 core._bag_scan_index = scan_index if scan_index._scans else None
                 core._bag_cmd_index = cmd_index if cmd_index.times else None
+                core._bag_plan_index = plan_index
+                core._bag_goal_index = goal_index
+                core.robot_description = robot_description
+                
                 core._bag_tf_pairs = tf_pairs
                 core._bag_names = {
                     "ns": ns,
@@ -1006,6 +1160,10 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 core.bag_cmd_prefix_has_lateral = bag_cmd_prefix_has_lateral
                 core.bag_cmd_prefix_has_ang_xy = bag_cmd_prefix_has_ang_xy
 
+                core.bag_cmd_prefix_avg_vx = bag_cmd_prefix_avg_vx
+                core.bag_cmd_prefix_max_vy_abs = bag_cmd_prefix_max_vy_abs
+                core.bag_cmd_prefix_avg_vy_abs = bag_cmd_prefix_avg_vy_abs
+
                 core.bag_cmd_t0 = bag_cmd_t0
                 core.bag_cmd_t1 = bag_cmd_t1
 
@@ -1017,32 +1175,8 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
             )
 
         except Exception as e:
+            print(f"[bag] Error: {e}")
             import traceback
-
-            print("BAG INDEX ERROR:", e)
             traceback.print_exc()
-            core = getattr(shared, "core", shared)
-            with core.lock:
-                core._bag_map_index = None
-                core._bag_global_costmap_index = None
-                core._bag_local_costmap_index = None
-                core._bag_scan_index = None
-                core._bag_cmd_index = None
-                core._bag_tf_pairs = {}
-                core._bag_names = {}
-                core.bag_cmd_times = []
-                core.bag_cmd_vx = []
-                core.bag_cmd_vy = []
-                core.bag_cmd_vz = []
-                core.bag_cmd_wx = []
-                core.bag_cmd_wy = []
-                core.bag_cmd_wz = []
-                core.bag_cmd_prefix_max_vx_fwd = []
-                core.bag_cmd_prefix_max_vx_rev = []
-                core.bag_cmd_prefix_max_wz_abs = []
-                core.bag_cmd_prefix_has_lateral = []
-                core.bag_cmd_prefix_has_ang_xy = []
-                core.bag_cmd_t0 = 0.0
-                core.bag_cmd_t1 = 0.0
 
     threading.Thread(target=_worker, daemon=True).start()

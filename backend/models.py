@@ -162,6 +162,9 @@ class CmdPrefixStats(BaseModel):
 
   max_vx_forward: float
   max_vx_reverse: float
+  avg_vx: float
+  max_vy_abs: float
+  avg_vy_abs: float
   max_wz_abs: float
 
   has_lateral: bool
@@ -181,3 +184,32 @@ class CmdStatsResponse(BaseModel):
 
   bag_t0: Optional[float] = None
   bag_t1: Optional[float] = None
+
+
+# ======================
+# Plan and Goal (bag mode)
+# ======================
+
+class PlanResponse(BaseModel):
+  """
+  Response for /api/v1/plan_at:
+  - t: timestamp of the plan
+  - poses: list of [x, y] tuples
+  """
+  t: float
+  poses: List[List[float]]
+
+
+class GoalResponse(BaseModel):
+  """
+  Response for /api/v1/goal_at:
+  - t: timestamp of the goal
+  - x: goal x
+  - y: goal y
+  - yaw: goal yaw
+  """
+  t: float
+  x: float
+  y: float
+  yaw: float
+

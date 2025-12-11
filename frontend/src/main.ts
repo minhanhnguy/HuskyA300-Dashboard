@@ -1674,6 +1674,15 @@ function updateHalfwayPoint(currentPose: { x: number; y: number }): void {
   const rel = Number(slider!.value) || 0;
   const absT = t0 + rel;
 
+  // 1. Dynamic Calculation (Always run this)
+  // Prevent premature triggering:
+  // Require a valid plan and min distance
+  if (!planPath || planPath.length === 0) {
+    halfwayPoint = null;
+    halfwayT = null;
+    return;
+  }
+
   // 1. Calculate History Distance
   let idx = 0;
   while (idx < poseHist.length && poseHist[idx].t <= absT) {
@@ -1703,19 +1712,10 @@ function updateHalfwayPoint(currentPose: { x: number; y: number }): void {
   // 3. Total Estimated Distance
   const totalDist = distHistory + distPlan;
 
-  // Prevent premature triggering:
-  // If not fixed yet, require a valid plan and min distance
-  if (!fixedHalfway) {
-    if (!planPath || planPath.length === 0) {
-      halfwayPoint = null;
-      halfwayT = null;
-      return;
-    }
-    if (totalDist < 1.0) {
-      halfwayPoint = null;
-      halfwayT = null;
-      return;
-    }
+  if (totalDist < 1.0) {
+    halfwayPoint = null;
+    halfwayT = null;
+    return;
   }
 
   const targetDist = totalDist * 0.5;
@@ -1814,37 +1814,46 @@ function updateHalfwayPoint(currentPose: { x: number; y: number }): void {
     candidateT = null;
   }
 
-  // 5. Fixed Marker Logic
-  // If we scrubbed back before the fixed point, reset it
-  if (fixedHalfway && absT < fixedHalfway.t) {
-    fixedHalfway = null;
+  // 5. Latch Logic
+  // If we found a reached point and haven't latched yet, latch it.
+  if (!fixedHalfway && candidatePoint && candidatePoint.reached && candidateT && candidateT.reached) {
+    fixedHalfway = {
+      t: candidateT.t,
+      x: candidatePoint.x,
+      y: candidatePoint.y
+    };
   }
 
-  // If we have a fixed marker, use it
-  if (fixedHalfway) {
+  // 6. Hybrid Display Logic
+  // Map Marker:
+  // - If Fixed AND Past Fixed Time: Show Fixed (Blue)
+  // - Else: Show Dynamic (Gray)
+  if (fixedHalfway && absT >= fixedHalfway.t) {
     halfwayPoint = { x: fixedHalfway.x, y: fixedHalfway.y, reached: true };
-    halfwayT = { t: fixedHalfway.t, reached: true };
   } else {
-    // Use calculated candidate
     halfwayPoint = candidatePoint;
+    // Force reached=false if we are showing dynamic (even if candidate says reached,
+    // if we are here it means we are before the fixed time or not fixed yet)
+    if (halfwayPoint) halfwayPoint.reached = false;
+  }
+
+  // Timeline Marker:
+  // - If Fixed: Show Fixed Time (Gray/Blue based on current time)
+  // - Else: Show Dynamic Time
+  if (fixedHalfway) {
+    const isPast = absT >= fixedHalfway.t;
+    halfwayT = { t: fixedHalfway.t, reached: isPast };
+  } else {
     halfwayT = candidateT;
-
-    // If we just reached it, fix it!
-    if (halfwayPoint && halfwayPoint.reached && halfwayT) {
-      fixedHalfway = { t: halfwayT.t, x: halfwayPoint.x, y: halfwayPoint.y };
-    }
   }
 
-  // 6. Visibility Logic
-  // Show if: (Reached/Fixed) OR (Plan Exists)
-  const show = (halfwayPoint && halfwayPoint.reached) || (planPath && planPath.length > 0);
-
-  if (!show) {
-    halfwayPoint = null;
-    halfwayT = null;
+  // 7. Visibility Logic
+  if (halfwayPoint) {
+    updateTimelineMarker();
+  } else {
+    const marker = document.getElementById("halfwayMarker");
+    if (marker) marker.style.display = "none";
   }
-
-  updateTimelineMarker();
 }
 
 function updateTimelineMarker(): void {

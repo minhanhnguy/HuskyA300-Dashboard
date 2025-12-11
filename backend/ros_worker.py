@@ -74,6 +74,9 @@ class CmdVelNode(Node):
         # Pose source is forced to odom; integrator is effectively disabled
         self.pose_mode = "odom"
 
+        # Paused flag (for bag mode)
+        self.paused = False
+
         # flags to know what we managed to latch on
         self._tf_ok = False
         self._odom_ok = False
@@ -191,6 +194,8 @@ class CmdVelNode(Node):
     # ======================================================================
 
     def on_cmd_in(self, msg: TwistStamped):
+        if self.paused:
+            return
         now_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9 if msg.header.stamp else \
                 self.get_clock().now().nanoseconds * 1e-9
         v = clip(msg.twist.linear.x, -C.V_MAX, C.V_MAX)
@@ -201,6 +206,8 @@ class CmdVelNode(Node):
             self.get_logger().info(f"[cmdvel_dash] First IN rx: v={v:.3f}, w={w:.3f}")
 
     def on_cmd_out(self, msg: TwistStamped):
+        if self.paused:
+            return
         now_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9 if msg.header.stamp else \
                 self.get_clock().now().nanoseconds * 1e-9
         v = clip(msg.twist.linear.x, -C.V_MAX, C.V_MAX)
@@ -212,6 +219,8 @@ class CmdVelNode(Node):
     # ======================================================================
 
     def on_map_full(self, msg: OccupancyGrid):
+        if self.paused:
+            return
         info = msg.info
         w, h = info.width, info.height
 
@@ -242,6 +251,8 @@ class CmdVelNode(Node):
         )
 
     def on_map_patch(self, up: OccupancyGridUpdate):
+        if self.paused:
+            return
         patch = {
             "x": int(up.x),
             "y": int(up.y),
@@ -252,6 +263,8 @@ class CmdVelNode(Node):
         self.core.apply_map_patch(patch)
 
     def on_global_costmap(self, msg: OccupancyGrid):
+        if self.paused:
+            return
         info = msg.info
         w, h = info.width, info.height
         arr = (
@@ -276,6 +289,8 @@ class CmdVelNode(Node):
         self.core.set_global_costmap(arr, meta)
 
     def on_local_costmap(self, msg: OccupancyGrid):
+        if self.paused:
+            return
         info = msg.info
         w, h = info.width, info.height
         arr = (
@@ -331,6 +346,8 @@ class CmdVelNode(Node):
         Use Odometry as the only pose source.
         Timestamps are from the message header.
         """
+        if self.paused:
+            return
         px = float(msg.pose.pose.position.x)
         py = float(msg.pose.pose.position.y)
 
@@ -477,6 +494,20 @@ class CmdVelNode(Node):
         threading.Thread(target=_thread, daemon=True).start()
         return True
 
+    # ======================================================================
+    # PAUSE / RESUME (for bag mode)
+    # ======================================================================
+
+    def pause(self):
+        """Stop processing incoming ROS messages (so bag replay is exclusive)."""
+        self.paused = True
+        self.get_logger().info("[cmdvel_dash] Paused live ROS listeners.")
+
+    def resume(self):
+        """Resume processing incoming ROS messages."""
+        self.paused = False
+        self.get_logger().info("[cmdvel_dash] Resumed live ROS listeners.")
+
 
 # ======================================================================
 # NODE STARTUP HELPERS
@@ -513,3 +544,13 @@ def start_ros_in_thread(shared: SharedState):
 
 def request_reverse_replay(speed: float = None) -> bool:
     return _NODE_SINGLETON.start_reverse_replay(speed) if _NODE_SINGLETON else False
+
+
+def pause_ros():
+    if _NODE_SINGLETON:
+        _NODE_SINGLETON.pause()
+
+
+def resume_ros():
+    if _NODE_SINGLETON:
+        _NODE_SINGLETON.resume()

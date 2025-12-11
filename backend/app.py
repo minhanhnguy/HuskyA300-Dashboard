@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .state import SharedState
-from .ros_worker import start_ros_in_thread, request_reverse_replay
+
+from .ros_worker import start_ros_in_thread, request_reverse_replay, pause_ros, resume_ros
 from . import config as C
 
 from .models import (
@@ -120,6 +121,7 @@ async def reset():
         core.yaw = 0.0
         core.path.clear()
         core.path.append((0.0, 0.0))
+    resume_ros()
     return {"ok": True}
 
 
@@ -307,6 +309,7 @@ async def bag_play(payload: dict):
             status_code=400, content={"error": "name is required"}
         )
     try:
+        pause_ros()
         replay_bag_in_thread(shared, name, speed=1.0)
     except FileNotFoundError:
         return JSONResponse(

@@ -29,10 +29,14 @@ from rclpy.qos import (
 from rclpy.time import Time
 from rclpy.duration import Duration
 
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import TwistStamped, PoseStamped
 from builtin_interfaces.msg import Time as RosTime
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from map_msgs.msg import OccupancyGridUpdate
+from sensor_msgs.msg import LaserScan
+from tf2_msgs.msg import TFMessage
+from std_msgs.msg import String as StringMsg
+from rosgraph_msgs.msg import Clock
 
 # Import TF types unconditionally; we’ll just not use them if disabled.
 from tf2_ros import (
@@ -164,6 +168,36 @@ class CmdVelNode(Node):
         self.get_logger().info(
             f"[cmdvel_dash] Replay publisher -> {C.PUBLISH_TOPIC}"
         )
+
+        # ------------------------------------------------------------------
+        # PUBLISHERS for bag playback (RViz visualization)
+        # ------------------------------------------------------------------
+        ns = getattr(C, "NAMESPACE", "/a300_0000")
+        if ns.endswith("/"):
+            ns = ns[:-1]
+        if not ns.startswith("/"):
+            ns = "/" + ns
+
+        self.pub_clock = self.create_publisher(Clock, "/clock", 10) # Clock is always global
+
+        # TF: Publish to both global and namespaced to be safe, or just namespaced if that's what RViz wants.
+        # Given the user's list has /a300_0000/tf, we should publish there.
+        self.pub_tf = self.create_publisher(TFMessage, f"{ns}/tf", 10)
+        self.pub_tf_static = self.create_publisher(TFMessage, f"{ns}/tf_static", qos_profile=QoSProfile(depth=1, durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL))
+
+        # MAP: Needs TRANSIENT_LOCAL durability for RViz
+        map_qos = QoSProfile(depth=1, durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_map = self.create_publisher(OccupancyGrid, f"{ns}/map", qos_profile=map_qos)
+        self.pub_gc = self.create_publisher(OccupancyGrid, f"{ns}/global_costmap/costmap", qos_profile=map_qos)
+        self.pub_lc = self.create_publisher(OccupancyGrid, f"{ns}/local_costmap/costmap", qos_profile=map_qos)
+        
+        self.pub_scan = self.create_publisher(LaserScan, f"{ns}/sensors/lidar2d_0/scan", 10)
+        self.pub_odom = self.create_publisher(Odometry, f"{ns}/odom", 10)
+        self.pub_plan = self.create_publisher(Path, f"{ns}/plan", 10)
+        self.pub_goal = self.create_publisher(PoseStamped, f"{ns}/goal_pose", 10)
+        self.pub_robot_desc = self.create_publisher(StringMsg, f"{ns}/robot_description", qos_profile=QoSProfile(depth=1, durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL))
+        
+        self._last_robot_desc = None
 
         # ------------------------------------------------------------------
         # TIMERS
@@ -508,6 +542,107 @@ class CmdVelNode(Node):
         self.paused = False
         self.get_logger().info("[cmdvel_dash] Resumed live ROS listeners.")
 
+    # ======================================================================
+    # BAG SNAPSHOT PUBLISHING
+    # ======================================================================
+
+    def publish_snapshot(self, t: float, snapshot: Dict[str, Any]):
+        """
+        Publish a snapshot of bag data to ROS topics.
+        snapshot dict keys: 'tf', 'tf_static', 'map', 'scan', 'odom', 'plan', 'goal', 'robot_description'
+        """
+        # 1. Clock
+        clock_msg = Clock()
+        sec = int(t)
+        nanosec = int((t - sec) * 1e9)
+        clock_msg.clock = RosTime(sec=sec, nanosec=nanosec)
+        self.pub_clock.publish(clock_msg)
+
+        # 2. TF
+        if "tf" in snapshot and snapshot["tf"]:
+            # snapshot['tf'] is a list of TFMessage objects or dicts?
+            # Assuming we construct TFMessage here or receive it.
+            # Let's assume snapshot['tf'] is a list of transform dicts or objects we can convert.
+            # Actually, bag_replay stores them as _StampedSE2 or similar.
+            # We need to convert them to TransformStamped.
+            # For simplicity, let's assume the snapshot service prepares the ROS messages or we do it here.
+            # Doing it here is better if we want to keep service pure.
+            # But converting _StampedSE2 to TransformStamped requires some math.
+            pass
+        
+        # Actually, let's assume the snapshot contains the raw data and we convert it here.
+        # OR, simpler: The snapshot contains the *nearest* message from the bag.
+        # But bag_replay deserializes them into internal structs.
+        # We might need to reconstruct ROS messages.
+
+        # Let's look at what bag_replay has.
+        # It has _StampedSE2 for TF.
+        # It has numpy arrays for Map.
+        # It has _Scan for Scan.
+        
+        # We need to convert these back to ROS messages.
+        
+        # TF
+        if "tf_list" in snapshot:
+            tf_msg = TFMessage()
+            for tf_data in snapshot["tf_list"]:
+                # tf_data: {child_frame_id, header: {frame_id, stamp}, transform: {translation, rotation}}
+                # This seems too complex to reconstruct if we only have _StampedSE2.
+                # _StampedSE2 only has x, y, yaw.
+                # But bag_replay also stores `tf_pairs` which are _StampedSE2.
+                # We might be missing the full 3D transform if we only use _StampedSE2.
+                # However, for 2D nav, SE2 is often enough.
+                pass
+
+        # Let's try to pass pre-constructed ROS messages (or dicts that look like them) from the service.
+        # That way this node just publishes.
+        
+        if "scan" in snapshot and snapshot["scan"]:
+            self.pub_scan.publish(snapshot["scan"])
+            
+        if "odom" in snapshot and snapshot["odom"]:
+            self.pub_odom.publish(snapshot["odom"])
+            
+        if "plan" in snapshot and snapshot["plan"]:
+            self.pub_plan.publish(snapshot["plan"])
+            
+        if "goal" in snapshot and snapshot["goal"]:
+            self.pub_goal.publish(snapshot["goal"])
+            
+        if "map" in snapshot and snapshot["map"]:
+            self.pub_map.publish(snapshot["map"])
+            
+        if "gc" in snapshot and snapshot["gc"]:
+            self.pub_gc.publish(snapshot["gc"])
+            
+        if "lc" in snapshot and snapshot["lc"]:
+            self.pub_lc.publish(snapshot["lc"])
+            
+        # Robot Description (Latched)
+        if "robot_description" in snapshot:
+            desc = snapshot["robot_description"]
+            if desc and desc != self._last_robot_desc:
+                msg = StringMsg()
+                msg.data = desc
+                self.pub_robot_desc.publish(msg)
+                self._last_robot_desc = desc
+                # self.get_logger().info("Published robot_description")
+        elif self._last_robot_desc is None:
+             # Try to get it from core if not in snapshot (e.g. if snapshot is sparse)
+             # But snapshot_service should have put it there if available.
+             pass
+
+        if "tf_msg" in snapshot and snapshot["tf_msg"]:
+            self.pub_tf.publish(snapshot["tf_msg"])
+            
+        if "tf_static_msg" in snapshot and snapshot["tf_static_msg"]:
+            # Publish static TFs. 
+            # We can publish them every time or check if we already did.
+            # Since they are static and latched, publishing once is enough, but republishing doesn't hurt much (except bandwidth).
+            # Given we are scrubbing, republishing ensures they are available if RViz was restarted.
+            self.pub_tf_static.publish(snapshot["tf_static_msg"])
+
+
 
 # ======================================================================
 # NODE STARTUP HELPERS
@@ -554,3 +689,9 @@ def pause_ros():
 def resume_ros():
     if _NODE_SINGLETON:
         _NODE_SINGLETON.resume()
+
+
+def publish_bag_snapshot(t: float, snapshot: Dict[str, Any]):
+    if _NODE_SINGLETON:
+        _NODE_SINGLETON.publish_snapshot(t, snapshot)
+

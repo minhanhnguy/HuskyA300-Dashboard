@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from .state import SharedState
 
-from .ros_worker import start_ros_in_thread, request_reverse_replay, pause_ros, resume_ros
+from .ros_worker import start_ros_in_thread, request_reverse_replay, pause_ros, resume_ros, publish_bag_snapshot
 from . import config as C
 
 from .models import (
@@ -38,6 +38,7 @@ from .services.costmap_service import (
     global_costmap_full_at_service,
     local_costmap_full_at_service,
 )
+from .services.snapshot_service import get_bag_snapshot_at_service
 
 # Optional bag helpers (graceful fallback if file not present)
 try:
@@ -315,6 +316,19 @@ async def bag_play(payload: dict):
         return JSONResponse(
             status_code=404, content={"error": "bag not found"}
         )
+    return {"ok": True}
+
+
+@app.post("/api/v1/bag/publish_at")
+async def bag_publish_at(
+    t: float = Query(..., description="Absolute bag time (seconds)"),
+):
+    """
+    Publish bag data at time t to ROS topics for RViz visualization.
+    """
+    core = get_core()
+    snapshot = get_bag_snapshot_at_service(core, t)
+    publish_bag_snapshot(t, snapshot)
     return {"ok": True}
 
 

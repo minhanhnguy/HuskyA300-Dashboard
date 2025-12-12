@@ -30,16 +30,26 @@ def get_cmd_stats_at_service(core, t: float) -> CmdStatsResponse:
     bag_t1 = idx.bag_t1 if idx.bag_t1 is not None else times[-1]
 
     # Outside cmd_vel span: tell UI what span exists, but no instant at t
-    if t < times[0] or t > times[-1]:
-        return CmdStatsResponse(
-            instant=None,
-            prefix=None,
-            bag_t0=bag_t0,
-            bag_t1=bag_t1,
-        )
+    # RELAXED: If t > times[-1], we still want the cumulative stats (prefix).
+    # instant_index_at handles t >= times[-1] by returning the last index.
+    # instant_index_at handles t < times[0] by returning None.
+    
+    # if t < times[0] or t > times[-1]:
+    #     return CmdStatsResponse(
+    #         instant=None,
+    #         prefix=None,
+    #         bag_t0=bag_t0,
+    #         bag_t1=bag_t1,
+    #     )
+
+    # Debug logging
+    print(f"[cmd_service] t={t}, times[0]={times[0]}, times[-1]={times[-1]}")
 
     i: Optional[int] = idx.instant_index_at(t)
+    print(f"[cmd_service] instant_index_at({t}) -> {i}")
+    
     if i is None:
+        print(f"[cmd_service] i is None, returning empty")
         return CmdStatsResponse(
             instant=None,
             prefix=None,

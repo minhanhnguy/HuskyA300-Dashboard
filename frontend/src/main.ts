@@ -55,13 +55,12 @@ const bagPanelClose = document.getElementById("bagPanelClose") as HTMLButtonElem
 const bagPanelStatus = document.getElementById("bagPanelStatus") as HTMLParagraphElement | null;
 const bagList = document.getElementById("bagList") as HTMLUListElement | null;
 
-// cmd_vel overlay elements
-// cmd_vel overlay elements
-// const cmdOverlayToggle = document.getElementById("cmdOverlayToggle") as HTMLButtonElement | null; // Removed
-const cmdOverlay = document.getElementById("cmdOverlay") as HTMLDivElement | null;
-const cmdOverlayCanvas = document.getElementById("cmdOverlayCanvas") as HTMLCanvasElement | null;
-const cmdInstantNumbers = document.getElementById("cmdInstantNumbers") as HTMLDivElement | null;
-const cmdPrefixNumbers = document.getElementById("cmdPrefixNumbers") as HTMLDivElement | null;
+// Analysis Panel elements
+// const cmdOverlayToggle = document.getElementById("cmdOverlayToggle") as HTMLButtonElement | null; // Analysis Panel elements
+const analysisPanel = document.getElementById("analysisPanel") as HTMLDivElement;
+const cmdOverlayCanvas = document.getElementById("cmdOverlayCanvas") as HTMLCanvasElement;
+const cmdInstantNumbers = document.getElementById("cmdInstantNumbers") as HTMLDivElement;
+const cmdPrefixNumbers = document.getElementById("cmdPrefixNumbers") as HTMLDivElement;
 const cmdOverlayCtx = cmdOverlayCanvas ? cmdOverlayCanvas.getContext("2d") : null;
 
 // View Menu Toggles
@@ -140,6 +139,7 @@ let lastScanReqAbsT: number | null = null;
 let scanReqInFlight = false;
 
 // cmd_vel overlay state (bag mode only)
+// Now controls the visibility of the bottom panel tab
 let cmdOverlayEnabled = false;
 let cmdStats: CmdStatsResponse | null = null;
 let lastCmdStatsReqAbsT: number | null = null;
@@ -431,13 +431,14 @@ async function waitForStablePoseHistory({
 // ==============================
 // cmd_vel overlay helpers
 // ==============================
-function setCmdOverlayVisible(on: boolean): void {
-  cmdOverlayEnabled = on;
-  if (!cmdOverlay) return;
-  if (on) {
-    cmdOverlay.classList.remove("hidden");
+function updateCmdOverlayVisibility(): void {
+  if (!analysisPanel) return;
+  // Show if enabled AND in bag mode
+  if (cmdOverlayEnabled && isBagMode) {
+    analysisPanel.classList.remove("hidden");
+    // Ensure the tab is active (if we had multiple tabs, we'd select it here)
   } else {
-    cmdOverlay.classList.add("hidden");
+    analysisPanel.classList.add("hidden");
   }
 }
 
@@ -514,6 +515,15 @@ async function requestCmdStatsAtAbs(absT: number): Promise<void> {
   }
 }
 
+async function requestPublishAtAbs(absT: number): Promise<void> {
+  if (!isBagMode || t0 == null) return;
+  try {
+    await fetch(`/api/v1/bag/publish_at?t=${encodeURIComponent(absT.toFixed(3))}`, { method: "POST" });
+  } catch {
+    // ignore
+  }
+}
+
 function resizeCmdOverlayCanvas(): void {
   if (!cmdOverlayCanvas || !cmdOverlayCtx) return;
   const dpr = window.devicePixelRatio || 1;
@@ -528,7 +538,7 @@ function resizeCmdOverlayCanvas(): void {
 }
 
 function drawCmdOverlayMini(): void {
-  if (!cmdOverlay || cmdOverlay.classList.contains("hidden")) return;
+  if (!analysisPanel || analysisPanel.classList.contains("hidden")) return;
   if (!cmdOverlayCanvas || !cmdOverlayCtx) return;
 
   resizeCmdOverlayCanvas();
@@ -754,19 +764,45 @@ const mapPalette: PaletteFn = (v) => {
 };
 
 const globalCostmapPalette: PaletteFn = (v) => {
-  if (v <= 0) return [0, 0, 0, 0];
-  if (v >= 99) return [0, 255, 255, 150]; // lethal: cyan
-  // gradient blue/green, more transparent
-  const alpha = Math.min(100, Math.floor((v / 100) * 150));
-  return [0, 255, 0, alpha];
+  // Global costmap: 25% opacity (alpha ~ 64)
+  const alpha = 64;
+
+  if (v === 0) return [0, 0, 0, 0]; // Transparent
+  if (v === -1) return [112, 137, 134, alpha]; // Grey-Green
+  if (v === 99) return [0, 255, 255, alpha];   // Cyan (Inscribed)
+  if (v === 100) return [255, 0, 255, alpha];  // Magenta (Lethal)
+
+  // 1-98: Blue -> Red
+  // v=1 => Blue (0,0,255), v=98 => Red (255,0,0)
+  if (v >= 1 && v <= 98) {
+    const t = (v - 1) / 97.0;
+    const r = Math.round(255 * t);
+    const b = Math.round(255 * (1 - t));
+    return [r, 0, b, alpha];
+  }
+
+  // Fallback for unexpected values
+  return [0, 0, 0, 0];
 };
 
 const localCostmapPalette: PaletteFn = (v) => {
-  if (v <= 0) return [0, 0, 0, 0];
-  if (v >= 99) return [255, 0, 255, 200]; // lethal: magenta
-  // gradient red, more opaque
-  const alpha = Math.min(200, Math.floor((v / 100) * 200));
-  return [255, 0, 0, alpha];
+  // Local costmap: Full opacity (or as defined)
+  const alpha = 255;
+
+  if (v === 0) return [0, 0, 0, 0]; // Transparent
+  if (v === -1) return [112, 137, 134, alpha]; // Grey-Green
+  if (v === 99) return [0, 255, 255, alpha];   // Cyan (Inscribed)
+  if (v === 100) return [255, 0, 255, alpha];  // Magenta (Lethal)
+
+  // 1-98: Blue -> Red
+  if (v >= 1 && v <= 98) {
+    const t = (v - 1) / 97.0;
+    const r = Math.round(255 * t);
+    const b = Math.round(255 * (1 - t));
+    return [r, 0, b, alpha];
+  }
+
+  return [0, 0, 0, 0];
 };
 
 class MapTiles {
@@ -1390,7 +1426,8 @@ async function playLoop(): Promise<void> {
       requestPlanAtAbs(absT),
       requestGoalAtAbs(absT),
       cmdOverlayEnabled ? requestCmdStatsAtAbs(absT) : Promise.resolve(),
-      fetchCostmapsAtRel(rel)
+      fetchCostmapsAtRel(rel),
+      requestPublishAtAbs(absT)
     ]);
 
     stopPlayback();
@@ -1410,7 +1447,8 @@ async function playLoop(): Promise<void> {
     requestPlanAtAbs(absT),
     requestGoalAtAbs(absT),
     cmdOverlayEnabled ? requestCmdStatsAtAbs(absT) : Promise.resolve(),
-    fetchCostmapsAtRel(rel)
+    fetchCostmapsAtRel(rel),
+    requestPublishAtAbs(absT)
   ]);
 
   lastAbsTForDelta = absT;
@@ -1546,6 +1584,7 @@ slider!.addEventListener("input", () => {
     requestPlanAtAbs(scrubTime);
     requestGoalAtAbs(scrubTime);
     if (cmdOverlayEnabled) requestCmdStatsAtAbs(scrubTime);
+    requestPublishAtAbs(scrubTime);
   }
 });
 
@@ -1561,6 +1600,7 @@ slider!.addEventListener("change", async () => {
   requestPlanAtAbs(absT);
   requestGoalAtAbs(absT);
   if (cmdOverlayEnabled) requestCmdStatsAtAbs(absT);
+  requestPublishAtAbs(absT);
 });
 
 // Jump-to-live (ignored in bag mode)
@@ -1626,7 +1666,8 @@ if (toggleGoal) {
 if (toggleCmdOverlay) {
   toggleCmdOverlay.addEventListener("change", () => {
     const next = toggleCmdOverlay.checked;
-    setCmdOverlayVisible(next);
+    cmdOverlayEnabled = next;
+    updateCmdOverlayVisibility();
     if (next) {
       if (isBagMode && t0 != null) {
         const rel = Number(slider!.value) || 0;
@@ -2092,7 +2133,7 @@ function drawPlan(): void {
 
   ctx.save();
   ctx.strokeStyle = "#00ff00"; // Green for plan
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 1;
   ctx.setLineDash([5, 5]); // Dashed line
 
   ctx.beginPath();
@@ -2226,7 +2267,7 @@ function draw(): void {
         ctx.lineTo(ex, ey);
       }
 
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1;
       ctx.strokeStyle = "#60a5fa"; // Blue-ish
       ctx.stroke();
 

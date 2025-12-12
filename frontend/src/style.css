@@ -4,7 +4,8 @@ body {
   margin: 0;
   height: 100%;
   background: #ffffff;
-  color: #111827; /* slate-900 */
+  color: #111827;
+  /* slate-900 */
   font-family: system-ui, sans-serif;
 }
 
@@ -14,14 +15,17 @@ body {
   display: flex;
   gap: 12px;
   align-items: center;
-  background: #f8fafc;            /* slate-50 */
-  border-bottom: 1px solid #e5e7eb;/* slate-200 */
+  background: #f8fafc;
+  /* slate-50 */
+  border-bottom: 1px solid #e5e7eb;
+  /* slate-200 */
 }
 
 #status {
   margin-left: auto;
   font-size: 12px;
-  color: #374151;                  /* slate-700 */
+  color: #374151;
+  /* slate-700 */
   opacity: 0.95;
 }
 
@@ -35,14 +39,18 @@ canvas {
   width: 100%;
   height: 100%;
   display: block;
-  background: #e6e6e6;            /* white canvas */
+  background: #e6e6e6;
+  /* white canvas */
 }
 
 /* Buttons */
 button {
-  background: #f3f4f6;             /* slate-100 */
-  color: #111827;                   /* slate-900 */
-  border: 1px solid #d1d5db;        /* slate-300 */
+  background: #f3f4f6;
+  /* slate-100 */
+  color: #111827;
+  /* slate-900 */
+  border: 1px solid #d1d5db;
+  /* slate-300 */
   border-radius: 8px;
   padding: 6px 10px;
   cursor: pointer;
@@ -50,7 +58,8 @@ button {
 }
 
 button:hover {
-  background: #e5e7eb;             /* slate-200 */
+  background: #e5e7eb;
+  /* slate-200 */
 }
 
 button.small {
@@ -63,12 +72,14 @@ button.small {
 label {
   user-select: none;
   font-size: 12px;
-  color: #374151;                   /* slate-700 */
+  color: #374151;
+  /* slate-700 */
   opacity: 0.95;
 }
 
 input[type="range"] {
-  accent-color: #2563eb;            /* blue-600 */
+  accent-color: #2563eb;
+  /* blue-600 */
 }
 
 #timeControls {
@@ -84,7 +95,8 @@ input[type="range"] {
 
 /* Muted text */
 .muted {
-  color: #6b7280;                   /* slate-500 */
+  color: #6b7280;
+  /* slate-500 */
   font-size: 11px;
 }
 
@@ -92,7 +104,8 @@ input[type="range"] {
 #bagPanel {
   position: fixed;
   inset: 0;
-  background: rgba(17, 24, 39, 0.25); /* subtle dark overlay */
+  background: rgba(17, 24, 39, 0.25);
+  /* subtle dark overlay */
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -106,11 +119,12 @@ input[type="range"] {
 
 #bagPanelInner {
   background: #ffffff;
-  border: 1px solid #e5e7eb;         /* slate-200 */
+  border: 1px solid #e5e7eb;
+  /* slate-200 */
   border-radius: 10px;
   width: 360px;
   max-height: 420px;
-  box-shadow: 0 16px 40px rgba(0,0,0,0.12);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.12);
   padding: 12px 14px 14px;
 }
 
@@ -143,8 +157,10 @@ input[type="range"] {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  background: #f9fafb;              /* slate-50 */
-  border: 1px solid #e5e7eb;         /* slate-200 */
+  background: #f9fafb;
+  /* slate-50 */
+  border: 1px solid #e5e7eb;
+  /* slate-200 */
   border-radius: 6px;
   padding: 6px 8px;
   margin-bottom: 6px;
@@ -154,12 +170,15 @@ input[type="range"] {
 }
 
 .bag-list li:hover {
-  background: #eef2ff;               /* indigo-50 */
-  border-color: #c7d2fe;             /* indigo-200 */
+  background: #eef2ff;
+  /* indigo-50 */
+  border-color: #c7d2fe;
+  /* indigo-200 */
 }
 
 .bag-list small {
-  color: #6b7280;                    /* slate-500 */
+  color: #6b7280;
+  /* slate-500 */
   font-size: 11px;
 }
 
@@ -176,8 +195,9 @@ input[type="range"] {
   padding: 8px 10px;
   background: #ffffff;
   border-radius: 10px;
-  border: 1px solid #e5e7eb;      /* slate-200 */
-  box-shadow: 0 16px 40px rgba(0,0,0,0.18);
+  border: 1px solid #e5e7eb;
+  /* slate-200 */
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.18);
 
   display: flex;
   flex-direction: column;
@@ -201,8 +221,10 @@ input[type="range"] {
 #cmdPrefixNumbers {
   font-size: 11px;
   line-height: 1.4;
-  white-space: pre-line;          /* respects the \n from TS */
-  color: #374151;                 /* slate-700 */
+  white-space: pre-line;
+  /* respects the \n from TS */
+  color: #374151;
+  /* slate-700 */
   border-radius: 6px;
   padding: 4px 6px;
   background: #f9fafb;
@@ -227,7 +249,7 @@ input[type="range"] {
   left: 0;
   background-color: #ffffff;
   min-width: 160px;
-  box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   z-index: 100;
@@ -243,7 +265,8 @@ input[type="range"] {
   cursor: pointer;
   font-size: 13px;
   color: #111827;
-  position: relative; /* For submenu positioning */
+  position: relative;
+  /* For submenu positioning */
 }
 
 .dropdown-item:hover {
@@ -258,7 +281,7 @@ input[type="range"] {
   top: 0;
   background-color: #ffffff;
   min-width: 180px;
-  box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
   border: 1px solid #e5e7eb;
   border-radius: 6px;
   padding: 4px 0;
@@ -282,4 +305,136 @@ input[type="range"] {
 
 .submenu-content input[type="checkbox"] {
   margin-right: 8px;
+}
+
+/* Analysis Panel (Bottom) */
+.analysis-panel {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 33px;
+  /* Collapsed state: match tab height + border */
+  background: white;
+  border-top: 1px solid #e5e7eb;
+  z-index: 1000;
+  transition: height 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 -4px 6px -1px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.analysis-panel:hover {
+  height: 35vh;
+  /* Expanded state: slightly taller to fit content */
+}
+
+/* Tabs */
+.panel-tabs {
+  display: flex;
+  background: #f3f4f6;
+  border-bottom: 1px solid #e5e7eb;
+  height: 32px;
+  /* Fixed height for tabs */
+  flex-shrink: 0;
+}
+
+.panel-tab {
+  padding: 0 16px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  color: #6b7280;
+  cursor: pointer;
+  border-right: 1px solid #e5e7eb;
+  display: flex;
+  align-items: center;
+}
+
+.panel-tab:hover {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+
+.panel-tab.active {
+  background: white;
+  color: #2563eb;
+  border-bottom: 2px solid #2563eb;
+  /* Highlight active tab */
+}
+
+/* Panel Content */
+.panel-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  background: white;
+}
+
+.tab-pane {
+  display: none;
+  height: 100%;
+  width: 100%;
+}
+
+.tab-pane.active {
+  display: block;
+}
+
+/* Cmd Vel Horizontal Layout */
+.cmd-horizontal-layout {
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  padding: 16px;
+  gap: 24px;
+  align-items: center;
+}
+
+.cmd-canvas-wrapper {
+  flex: 0 0 auto;
+  height: 100%;
+  aspect-ratio: 1 / 1;
+  /* Keep it square-ish or let it scale */
+  min-width: 200px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  position: relative;
+}
+
+#cmdOverlayCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.cmd-metrics-container {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  /* Horizontal metrics blocks */
+  gap: 24px;
+  overflow-y: auto;
+}
+
+.cmd-metrics-block {
+  flex: 1;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 12px;
+  font-family: monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #374151;
+  white-space: pre-wrap;
+}
+
+/* Hide the old overlay styles if they conflict, or just reuse classes where possible */
+.hidden {
+  display: none !important;
 }

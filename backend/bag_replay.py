@@ -12,6 +12,18 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 import rosbag2_py
 from std_msgs.msg import String as StringMsg
+from geometry_msgs.msg import TransformStamped
+
+@dataclass
+class _StampedTransform:
+    t: float
+    tx: float
+    ty: float
+    tz: float
+    qx: float
+    qy: float
+    qz: float
+    qw: float
 
 from . import config as C
 
@@ -684,6 +696,11 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
 
             # Generic TF pairs for scan service
             tf_pairs: Dict[Tuple[str, str], List[_StampedSE2]] = {}
+            
+            # Full 3D TF pairs for RViz visualization
+            tf_3d_pairs: Dict[Tuple[str, str], List[_StampedTransform]] = {}
+            # Static TFs
+            tf_static_list: List[TransformStamped] = []
 
             # Detect frame-name pairs to accept for map->odom and odom->base
             map_candidates = ["map", f"{ns}/map", "/map"]
@@ -843,28 +860,46 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
 
                 elif topic in tf_topics:
                     msg = deserialize_message(raw, TFMsg)
-                    # Each TFMessage has an array of TransformStamped
+                    is_static = "static" in topic
+                    
                     for ts in msg.transforms:
+                        if is_static:
+                            tf_static_list.append(ts)
+                            # Also add to 3D pairs? Static TFs are valid at all times.
+                            # But for interpolation, we usually handle them separately.
+                            # Let's just store them in tf_static_list for now.
+                            continue
+
                         t = float(ts.header.stamp.sec) + float(
                             ts.header.stamp.nanosec
                         ) * 1e-9
                         parent = ts.header.frame_id.strip()
                         child = ts.child_frame_id.strip()
+                        
+                        # SE2 logic (keep existing)
                         x = float(ts.transform.translation.x)
                         y = float(ts.transform.translation.y)
                         yaw = _yaw_from_quat(ts.transform.rotation)
                         se = _StampedSE2(t=t, x=x, y=y, yaw=yaw)
-
-                        # store generic TF pair
                         tf_pairs.setdefault((parent, child), []).append(se)
-
-                        # dedicated map->odom list
+                        
                         if (parent in map_candidates) and (child in odom_candidates):
                             tf_map_odom.append(se)
-
-                        # dedicated odom->base list
                         if (parent in odom_candidates) and (child in base_candidates):
                             tf_odom_base.append(se)
+
+                        # 3D logic
+                        st = _StampedTransform(
+                            t=t,
+                            tx=float(ts.transform.translation.x),
+                            ty=float(ts.transform.translation.y),
+                            tz=float(ts.transform.translation.z),
+                            qx=float(ts.transform.rotation.x),
+                            qy=float(ts.transform.rotation.y),
+                            qz=float(ts.transform.rotation.z),
+                            qw=float(ts.transform.rotation.w),
+                        )
+                        tf_3d_pairs.setdefault((parent, child), []).append(st)
 
                 elif scan_topic and topic == scan_topic:
                     msg = deserialize_message(raw, Laser)
@@ -932,11 +967,14 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                     if robot_description is None:
                         msg = deserialize_message(raw, StringMsg)
                         robot_description = msg.data
+                        print(f"[bag] Found robot_description in {topic} (len={len(robot_description)})")
 
             # Sort by time
             poses_odom.sort(key=lambda p: p[0])
             tf_map_odom.sort(key=lambda s: s.t)
             tf_odom_base.sort(key=lambda s: s.t)
+            for k in tf_3d_pairs:
+                tf_3d_pairs[k].sort(key=lambda s: s.t)
             scan_index.finalize()
             cmd_index.finalize()
             plan_index.finalize()
@@ -1138,6 +1176,8 @@ def replay_bag_in_thread(shared, name: str, speed: float = 1.0):
                 core.robot_description = robot_description
                 
                 core._bag_tf_pairs = tf_pairs
+                core._bag_tf_3d_pairs = tf_3d_pairs
+                core._bag_tf_static_list = tf_static_list
                 core._bag_names = {
                     "ns": ns,
                     "map_candidates": map_candidates,

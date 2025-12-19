@@ -13,6 +13,7 @@
     <button id="liveModeBtn">Go back to Live</button>
     <button id="bagPanelBtn">Bag files playback</button>
     <button id="playBtn" style="display:none">Play</button>
+    <button id="attackModeBtn" style="display:none" class="attack-btn">🎯 Attack Mode</button>
 
     <div id="timeControls">
       <label for="timeSlider">Time</label>
@@ -86,6 +87,19 @@
       <div id="bagPanelBody">
         <p id="bagPanelStatus" class="muted">Loading…</p>
         <ul id="bagList" class="bag-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Attack Mode Confirmation Modal -->
+  <div id="attackModal" class="modal hidden">
+    <div id="attackModalInner" class="modal-content">
+      <h3>🎯 Confirm Attack Target</h3>
+      <p id="attackModalCoords" class="attack-coords">Target: (0.00, 0.00)</p>
+      <p class="attack-info">After confirmation, the robot will follow the bag path to 50%,<br>then generate fake data toward the original goal.</p>
+      <div class="modal-buttons">
+        <button id="attackConfirmBtn" class="btn-confirm">Confirm Attack</button>
+        <button id="attackCancelBtn" class="btn-cancel">Cancel</button>
       </div>
     </div>
   </div>

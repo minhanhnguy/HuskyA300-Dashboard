@@ -438,3 +438,145 @@ input[type="range"] {
 .hidden {
   display: none !important;
 }
+
+/* Attack Mode Button */
+.attack-btn {
+  background: #fee2e2;
+  /* red-100 */
+  color: #dc2626;
+  /* red-600 */
+  border: 1px solid #fca5a5;
+  /* red-300 */
+}
+
+.attack-btn:hover {
+  background: #fecaca;
+  /* red-200 */
+}
+
+.attack-btn.active {
+  background: #dc2626;
+  /* red-600 */
+  color: #ffffff;
+  border-color: #b91c1c;
+  /* red-700 */
+}
+
+.attack-btn.confirmed {
+  background: #7f1d1d;
+  /* red-900 */
+  color: #ffffff;
+  border-color: #7f1d1d;
+}
+
+/* Attack Mode Modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 200;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-content {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  width: 400px;
+  max-width: 90vw;
+  padding: 20px 24px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+  text-align: center;
+}
+
+.modal-content h3 {
+  margin: 0 0 16px;
+  font-size: 18px;
+  color: #111827;
+}
+
+.attack-coords {
+  font-family: monospace;
+  font-size: 16px;
+  background: #f3f4f6;
+  padding: 8px 16px;
+  border-radius: 6px;
+  margin: 12px 0;
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.attack-info {
+  font-size: 13px;
+  color: #6b7280;
+  margin: 12px 0 20px;
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.btn-confirm {
+  background: #dc2626;
+  color: white;
+  border: none;
+  padding: 10px 24px;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-confirm:hover {
+  background: #b91c1c;
+}
+
+.btn-cancel {
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #d1d5db;
+  padding: 10px 24px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.btn-cancel:hover {
+  background: #e5e7eb;
+}
+
+/* Attack Status Indicator */
+.attack-status {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-left: 10px;
+}
+
+.attack-status.selecting {
+  background: #fef3c7;
+  color: #d97706;
+}
+
+.attack-status.confirmed {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.attack-status.fake-data {
+  background: #fecaca;
+  color: #b91c1c;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}

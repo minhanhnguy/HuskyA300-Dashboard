@@ -55,6 +55,13 @@ const bagPanelClose = document.getElementById("bagPanelClose") as HTMLButtonElem
 const bagPanelStatus = document.getElementById("bagPanelStatus") as HTMLParagraphElement | null;
 const bagList = document.getElementById("bagList") as HTMLUListElement | null;
 
+// Attack Mode elements
+const attackModeBtn = document.getElementById("attackModeBtn") as HTMLButtonElement | null;
+const attackModal = document.getElementById("attackModal") as HTMLDivElement | null;
+const attackModalCoords = document.getElementById("attackModalCoords") as HTMLParagraphElement | null;
+const attackConfirmBtn = document.getElementById("attackConfirmBtn") as HTMLButtonElement | null;
+const attackCancelBtn = document.getElementById("attackCancelBtn") as HTMLButtonElement | null;
+
 // Analysis Panel elements
 // const cmdOverlayToggle = document.getElementById("cmdOverlayToggle") as HTMLButtonElement | null; // Analysis Panel elements
 const analysisPanel = document.getElementById("analysisPanel") as HTMLDivElement;
@@ -171,6 +178,23 @@ let planReqInFlight = false;
 let goalReqInFlight = false;
 let lastPlanReqAbsT: number | null = null;
 let lastGoalReqAbsT: number | null = null;
+
+// Attack Mode state
+interface FakeDataEntry {
+  timestamp: number;
+  pose: { x: number; y: number; yaw: number };
+  cmd_vel: { vx: number; vy: number; wz: number };
+  plan: [number, number][];
+}
+let attackModeEnabled = false;      // user has activated attack mode selection
+let attackTarget: { x: number; y: number } | null = null;  // clicked position
+let attackConfirmed = false;        // user confirmed the attack
+let attackHalfwayReached = false;   // robot reached 50% of original path
+let attackHalfwayTime: number | null = null; // timestamp when 50% was reached
+let fakeDataLog: FakeDataEntry[] = [];  // fake data entries with timestamps
+let originalGoalAtAttack: { x: number; y: number; yaw: number } | null = null;  // goal at attack start
+let storedNavPath: [number, number][] | null = null;  // nav path stored at 50% point
+let fakePathProgress = 0;  // distance traveled along storedNavPath (meters)
 
 // Robot Description (URDF)
 // Default fallback: Husky A300 (0.99m x 0.698m)
@@ -1323,6 +1347,19 @@ async function startBagReplay(name: string): Promise<void> {
   // Hide the small "Live" button and show Play/Pause (if present)
   if (liveBtn) liveBtn.style.display = "none";
   if (playBtn) playBtn.style.display = "";
+  if (attackModeBtn) attackModeBtn.style.display = "";  // Show attack mode button
+
+  // Reset attack mode state for new bag
+  attackModeEnabled = false;
+  attackTarget = null;
+  attackConfirmed = false;
+  attackHalfwayReached = false;
+  attackHalfwayTime = null;
+  fakeDataLog = [];
+  originalGoalAtAttack = null;
+  storedNavPath = null;
+  fakePathProgress = 0;
+  if (attackModeBtn) attackModeBtn.classList.remove("active", "confirmed", "fake-data");
 
   path = [];
   scanPoints = null;
@@ -1399,9 +1436,6 @@ async function playLoop(): Promise<void> {
   }
 
   // Calculate dt, but clamp it to avoid huge jumps if fetching takes long
-  // We want to advance time by actual elapsed time, but if the loop is slow,
-  // we effectively slow down playback.
-  // Let's say we target real-time.
   let dt = (now - lastTickTs) / 1000;
   lastTickTs = now;
 
@@ -1411,6 +1445,146 @@ async function playLoop(): Promise<void> {
   const dur = getDuration();
   let rel = Number(slider!.value) || 0;
   rel += dt * playRate;
+
+  // =========================================
+  // ATTACK MODE: Check for 50% and generate fake data
+  // =========================================
+  if (attackConfirmed && !attackHalfwayReached && fixedHalfway) {
+    // Check if we've reached the 50% point
+    const currentAbsT = (t0 ?? 0) + rel;
+    if (fixedHalfway && currentAbsT >= fixedHalfway.t) {
+      attackHalfwayReached = true;
+      attackHalfwayTime = currentAbsT;
+
+      // Store the current navigation path from the bag - this is what we'll follow
+      if (planPath && planPath.length > 0) {
+        storedNavPath = [...planPath];
+        fakePathProgress = 0;
+      }
+
+      setStatus(`Attack mode: 50% reached. Generating fake location data following nav path.`);
+
+      // Update button
+      if (attackModeBtn) {
+        attackModeBtn.textContent = "🎯 SPOOFING";
+        attackModeBtn.classList.add("fake-data");
+      }
+    }
+  }
+
+  // If attack mode is confirmed and we've passed 50%, generate fake data following nav path
+  if (attackConfirmed && attackHalfwayReached && storedNavPath && storedNavPath.length > 0) {
+    const currentPose = scrubPose || getBagPoseAtRel(rel);
+
+    // Movement speed (m/s) - realistic robot speed
+    const speed = 0.5;
+    const moveAmount = speed * dt;
+
+    // Advance along the stored navigation path
+    fakePathProgress += moveAmount;
+
+    // Calculate cumulative distances along storedNavPath
+    let cumulativeDistances: number[] = [0];
+    let totalPathLength = 0;
+    for (let i = 1; i < storedNavPath.length; i++) {
+      const dx = storedNavPath[i][0] - storedNavPath[i - 1][0];
+      const dy = storedNavPath[i][1] - storedNavPath[i - 1][1];
+      const segLen = Math.sqrt(dx * dx + dy * dy);
+      totalPathLength += segLen;
+      cumulativeDistances.push(totalPathLength);
+    }
+
+    // Find position along path based on fakePathProgress
+    let fakeX: number, fakeY: number, fakeYaw: number;
+
+    if (fakePathProgress >= totalPathLength) {
+      // Reached end of navigation path
+      const lastPt = storedNavPath[storedNavPath.length - 1];
+      fakeX = lastPt[0];
+      fakeY = lastPt[1];
+      // Calculate yaw from previous point
+      if (storedNavPath.length > 1) {
+        const prevPt = storedNavPath[storedNavPath.length - 2];
+        fakeYaw = Math.atan2(lastPt[1] - prevPt[1], lastPt[0] - prevPt[0]);
+      } else {
+        fakeYaw = currentPose.yaw;
+      }
+
+      setStatus("Attack mode: Fake navigation path complete.");
+      stopPlayback();
+      return;
+    } else {
+      // Interpolate position along nav path
+      let segIdx = 0;
+      while (segIdx < cumulativeDistances.length - 1 && cumulativeDistances[segIdx + 1] < fakePathProgress) {
+        segIdx++;
+      }
+
+      const segStart = storedNavPath[segIdx];
+      const segEnd = storedNavPath[Math.min(segIdx + 1, storedNavPath.length - 1)];
+      const segStartDist = cumulativeDistances[segIdx];
+      const segEndDist = cumulativeDistances[Math.min(segIdx + 1, cumulativeDistances.length - 1)];
+      const segLength = segEndDist - segStartDist;
+
+      if (segLength > 0.001) {
+        const t = (fakePathProgress - segStartDist) / segLength;
+        fakeX = segStart[0] + (segEnd[0] - segStart[0]) * t;
+        fakeY = segStart[1] + (segEnd[1] - segStart[1]) * t;
+        fakeYaw = Math.atan2(segEnd[1] - segStart[1], segEnd[0] - segStart[0]);
+      } else {
+        fakeX = segStart[0];
+        fakeY = segStart[1];
+        fakeYaw = currentPose.yaw;
+      }
+    }
+
+    // Update scrub pose with fake data
+    scrubPose = { x: fakeX, y: fakeY, yaw: fakeYaw };
+
+    // Calculate fake cmd_vel
+    const distRemaining = totalPathLength - fakePathProgress;
+    const fakeVx = Math.min(speed, distRemaining * 0.5);
+    const fakeWz = 0.0;
+
+    // The remaining nav path from current position
+    const remainingPath: [number, number][] = [[fakeX, fakeY]];
+    for (let i = 0; i < storedNavPath.length; i++) {
+      if (cumulativeDistances[i] > fakePathProgress) {
+        remainingPath.push(storedNavPath[i]);
+      }
+    }
+
+    // Log fake data entry
+    const fakeEntry: FakeDataEntry = {
+      timestamp: (t0 ?? 0) + rel,
+      pose: { x: fakeX, y: fakeY, yaw: fakeYaw },
+      cmd_vel: { vx: fakeVx, vy: 0, wz: fakeWz },
+      plan: remainingPath,
+    };
+    fakeDataLog.push(fakeEntry);
+
+    // Update displayed plan path with remaining fake path
+    planPath = remainingPath;
+
+    // Continue time-based updates but don't fetch bag pose data
+    updateTimeUI(rel);
+    lastAbsTForDelta = (t0 ?? 0) + rel;
+
+    // Only fetch map/costmaps (static elements)
+    await Promise.all([
+      fetchMapDeltaBetween(lastAbsTForDelta!, (t0 ?? 0) + rel),
+      fetchCostmapsAtRel(rel),
+    ]);
+
+    // Schedule next iteration
+    if (isPlaying) {
+      requestAnimationFrame(() => void playLoop());
+    }
+    return;
+  }
+  // =========================================
+  // END ATTACK MODE SPECIAL HANDLING
+  // =========================================
 
   if (rel >= dur) {
     rel = dur;
@@ -1455,13 +1629,6 @@ async function playLoop(): Promise<void> {
 
   // Schedule next iteration immediately
   if (isPlaying) {
-    // We use setTimeout(..., 0) or just call recursively?
-    // Recursive call might stack overflow if not careful, but async function returns Promise, so it's fine.
-    // Better to use requestAnimationFrame to yield to UI thread, 
-    // but we want to drive this as fast as possible (or as slow as needed).
-    // requestAnimationFrame might be too fast if we just did a heavy fetch?
-    // No, requestAnimationFrame is good for rendering.
-    // Actually, we just finished a heavy fetch. We should let the browser render.
     requestAnimationFrame(() => void playLoop());
   }
 }
@@ -1489,6 +1656,19 @@ liveModeBtn.onclick = async () => {
 
   if (liveBtn) liveBtn.style.display = "";
   if (playBtn) playBtn.style.display = "none";
+  if (attackModeBtn) attackModeBtn.style.display = "none";  // Hide attack mode button
+
+  // Reset attack mode state
+  attackModeEnabled = false;
+  attackTarget = null;
+  attackConfirmed = false;
+  attackHalfwayReached = false;
+  attackHalfwayTime = null;
+  fakeDataLog = [];
+  originalGoalAtAttack = null;
+  storedNavPath = null;
+  fakePathProgress = 0;
+  if (attackModeBtn) attackModeBtn.classList.remove("active", "confirmed", "fake-data");
 
   scanPoints = null;
   lastScanReqAbsT = null;
@@ -2158,6 +2338,64 @@ function drawPlan(): void {
   ctx.restore();
 }
 
+// ==============================
+// Attack Mode: Draw attack target marker
+// ==============================
+function drawAttackTarget(): void {
+  if (!attackTarget) return;
+  if (!attackModeEnabled && !attackConfirmed) return;
+
+  const [x, y] = world2screen(attackTarget.x, attackTarget.y);
+  const size = Math.max(12, 18 * (zoomTransform.k / 40));
+
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Draw a distinct red target marker with crosshair
+  // Outer ring
+  ctx.strokeStyle = "#dc2626"; // red-600
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(0, 0, size, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Inner ring
+  ctx.strokeStyle = "#fca5a5"; // red-300
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, size * 0.6, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Crosshair
+  ctx.strokeStyle = "#dc2626";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-size * 1.4, 0);
+  ctx.lineTo(-size * 0.7, 0);
+  ctx.moveTo(size * 0.7, 0);
+  ctx.lineTo(size * 1.4, 0);
+  ctx.moveTo(0, -size * 1.4);
+  ctx.lineTo(0, -size * 0.7);
+  ctx.moveTo(0, size * 0.7);
+  ctx.lineTo(0, size * 1.4);
+  ctx.stroke();
+
+  // Center dot
+  ctx.fillStyle = "#dc2626";
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Label
+  ctx.fillStyle = "#dc2626";
+  ctx.font = "bold 12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText("🎯 Attack", 0, -size - 4);
+
+  ctx.restore();
+}
+
 function drawGoal(): void {
   if (!goalPose) return;
 
@@ -2215,6 +2453,7 @@ function draw(): void {
     if (showLidar) drawLidar();
     if (showPlan) drawPlan();
     if (showGoal) drawGoal();
+    drawAttackTarget(); // Attack target marker (always draws if target exists)
 
     // Which pose to render
     let renderPose: { x: number; y: number; yaw: number };
@@ -2334,3 +2573,144 @@ function draw(): void {
 }
 
 requestAnimationFrame(draw);
+
+// ==============================
+// Attack Mode: Event Handlers
+// ==============================
+
+// Convert screen coordinates to world coordinates
+function screen2world(sx: number, sy: number): { x: number; y: number } {
+  const x = zoomTransform.invertX(sx);
+  const y = -zoomTransform.invertY(sy); // +y up
+  return { x, y };
+}
+
+// Open the attack modal with coordinates
+function openAttackModal(worldX: number, worldY: number): void {
+  if (!attackModal || !attackModalCoords) return;
+  attackTarget = { x: worldX, y: worldY };
+  attackModalCoords.textContent = `Target: (${worldX.toFixed(2)}, ${worldY.toFixed(2)})`;
+  attackModal.classList.remove("hidden");
+}
+
+// Close the attack modal
+function closeAttackModal(): void {
+  if (!attackModal) return;
+  attackModal.classList.add("hidden");
+}
+
+// Confirm the attack target
+function confirmAttack(): void {
+  if (!attackTarget) return;
+
+  attackConfirmed = true;
+  attackModeEnabled = false;
+
+  // Store the current goal for later reference
+  if (goalPose) {
+    originalGoalAtAttack = { ...goalPose };
+  }
+
+  // Clear fake data log
+  fakeDataLog = [];
+  attackHalfwayReached = false;
+  attackHalfwayTime = null;
+
+  // Update button state
+  if (attackModeBtn) {
+    attackModeBtn.classList.remove("active");
+    attackModeBtn.classList.add("confirmed");
+    attackModeBtn.textContent = "🎯 Attack Active";
+  }
+
+  closeAttackModal();
+  setStatus(`Attack confirmed at (${attackTarget.x.toFixed(2)}, ${attackTarget.y.toFixed(2)}). Play to begin.`);
+}
+
+// Cancel the attack
+function cancelAttack(): void {
+  attackTarget = null;
+  closeAttackModal();
+}
+
+// Export fake data to JSON
+function exportFakeData(): void {
+  if (fakeDataLog.length === 0) {
+    setStatus("No fake data to export.");
+    return;
+  }
+
+  const exportData = {
+    attack_target: attackTarget,
+    original_goal: originalGoalAtAttack,
+    halfway_timestamp: attackHalfwayTime,
+    entries: fakeDataLog,
+  };
+
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `fake_data_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  setStatus(`Exported ${fakeDataLog.length} fake data entries.`);
+}
+
+// Attack mode button click
+if (attackModeBtn) {
+  attackModeBtn.onclick = () => {
+    if (!isBagMode) return;
+
+    if (attackConfirmed) {
+      // If already confirmed, clicking exports the data
+      exportFakeData();
+      return;
+    }
+
+    // Toggle attack mode selection
+    attackModeEnabled = !attackModeEnabled;
+
+    if (attackModeEnabled) {
+      attackModeBtn.classList.add("active");
+      attackModeBtn.textContent = "🎯 Click Map to Select Target";
+      setStatus("Attack mode: Click on the map to select target location.");
+    } else {
+      attackModeBtn.classList.remove("active");
+      attackModeBtn.textContent = "🎯 Attack Mode";
+      attackTarget = null;
+      setStatus("Attack mode cancelled.");
+    }
+  };
+}
+
+// Canvas click handler for attack target selection
+canvas.addEventListener("click", (ev: MouseEvent) => {
+  if (!isBagMode || !attackModeEnabled) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const sx = (ev.clientX - rect.left) * dpr;
+  const sy = (ev.clientY - rect.top) * dpr;
+
+  const world = screen2world(sx, sy);
+  openAttackModal(world.x, world.y);
+});
+
+// Modal button handlers
+if (attackConfirmBtn) {
+  attackConfirmBtn.onclick = confirmAttack;
+}
+if (attackCancelBtn) {
+  attackCancelBtn.onclick = cancelAttack;
+}
+
+// Close modal when clicking outside
+if (attackModal) {
+  attackModal.addEventListener("click", (ev: MouseEvent) => {
+    if (ev.target === attackModal) {
+      cancelAttack();
+    }
+  });
+}

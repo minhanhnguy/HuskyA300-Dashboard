@@ -5,8 +5,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Husky Dashboard</title>
-  <script type="module" crossorigin src="/assets/index-CoNifUyB.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-C7rnQU6l.css">
+  <script type="module" crossorigin src="/assets/index-BYRFG3KB.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-LQ_vCthW.css">
 </head>
 
 <body>
@@ -14,6 +14,7 @@
     <button id="liveModeBtn">Go back to Live</button>
     <button id="bagPanelBtn">Bag files playback</button>
     <button id="playBtn" style="display:none">Play</button>
+    <button id="attackModeBtn" style="display:none" class="attack-btn">🎯 Attack Mode</button>
 
     <div id="timeControls">
       <label for="timeSlider">Time</label>
@@ -57,21 +58,23 @@
     <canvas id="view"></canvas>
 
     <!-- cmd_vel analysis overlay; absolutely positioned on top of canvas -->
-    <div id="cmdOverlay" class="cmd-overlay hidden">
-      <div class="cmd-overlay-header">
-        <span class="cmd-overlay-title">cmd_vel analysis</span>
+    <!-- Analysis Panel (Collapsible Bottom Panel) -->
+    <div id="analysisPanel" class="analysis-panel">
+      <div class="panel-tabs">
+        <button class="panel-tab active" data-tab="cmd_vel">Cmd Vel Analysis</button>
       </div>
-      <div class="cmd-overlay-body">
-        <canvas id="cmdOverlayCanvas"></canvas>
-        <div class="cmd-overlay-metrics">
-          <div id="cmdInstantNumbers" class="cmd-metrics-block"></div>
-          <div id="cmdPrefixNumbers" class="cmd-metrics-block"></div>
+      <div class="panel-content">
+        <div id="tab-cmd_vel" class="tab-pane active">
+          <div class="cmd-horizontal-layout">
+            <div class="cmd-canvas-wrapper">
+              <canvas id="cmdOverlayCanvas"></canvas>
+            </div>
+            <div class="cmd-metrics-container">
+              <div id="cmdInstantNumbers" class="cmd-metrics-block"></div>
+              <div id="cmdPrefixNumbers" class="cmd-metrics-block"></div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="cmd-overlay-footer">
-        <span class="cmd-overlay-hint">
-          Bag mode only · start → slider time
-        </span>
       </div>
     </div>
   </div>
@@ -85,6 +88,19 @@
       <div id="bagPanelBody">
         <p id="bagPanelStatus" class="muted">Loading…</p>
         <ul id="bagList" class="bag-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Attack Mode Confirmation Modal -->
+  <div id="attackModal" class="modal hidden">
+    <div id="attackModalInner" class="modal-content">
+      <h3>🎯 Confirm Attack Target</h3>
+      <p id="attackModalCoords" class="attack-coords">Target: (0.00, 0.00)</p>
+      <p class="attack-info">After confirmation, the robot will follow the bag path to 50%,<br>then generate fake data toward the original goal.</p>
+      <div class="modal-buttons">
+        <button id="attackConfirmBtn" class="btn-confirm">Confirm Attack</button>
+        <button id="attackCancelBtn" class="btn-cancel">Cancel</button>
       </div>
     </div>
   </div>

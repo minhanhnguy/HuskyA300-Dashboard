@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any
 import numpy as np
 
 from ..models import MapFullAtResponse, MapMeta, MapOrigin
-from .. import config as C
+from ..core import config as C
 import math
 from dataclasses import dataclass
 

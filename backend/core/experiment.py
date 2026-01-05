@@ -1,12 +1,17 @@
-# backend/research_core.py
+# backend/core/experiment.py
+"""
+ExperimentCapture: The central data store for robot state.
+ROS nodes push data into this; FastAPI reads from it.
+"""
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Deque, Dict, Any, Tuple, Optional, List
 from collections import deque
 import numpy as np
 import threading
 
-# These lengths match what you had in state.py / config.py
+# Buffer size limits
 HIST_MAX = 200_000
 POSE_MAX = 100_000
 PATH_MAX = 10_000
@@ -15,6 +20,7 @@ MAP_PATCH_MAX = 2_000
 
 @dataclass
 class CmdSample:
+    """A single cmd_vel sample."""
     v: float
     w: float
     t: float  # seconds
@@ -22,6 +28,7 @@ class CmdSample:
 
 @dataclass
 class PoseSample:
+    """A single pose sample."""
     t: float
     x: float
     y: float
@@ -55,7 +62,7 @@ class ExperimentCapture:
         self.pose_history: Deque[Tuple[float, float, float, float]] = deque(maxlen=POSE_MAX)
 
         # map state
-        self.map_grid: Optional[np.ndarray] = None   # int8 [H, W]
+        self.map_grid: Optional[np.ndarray] = None  # int8 [H, W]
         self.map_info: Optional[Dict[str, Any]] = None
         self.map_version: int = 0
         self.map_patch_queue: Deque[Dict[str, Any]] = deque(maxlen=MAP_PATCH_MAX)

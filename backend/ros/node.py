@@ -47,9 +47,9 @@ from tf2_ros import (
     ExtrapolationException,
 )
 
-from .state import SharedState
-from .utils import clip, wrap_pi
-from . import config as C
+from ..core.state import SharedState
+from ..utils.math import clip, wrap_pi
+from ..core import config as C
 
 # we keep a process-global pointer so /api/v1/reverse_replay can trigger it
 _NODE_SINGLETON: Optional["CmdVelNode"] = None
@@ -467,7 +467,7 @@ class CmdVelNode(Node):
     # ======================================================================
 
     def start_reverse_replay(self, speed: float = None) -> bool:
-        from . import config as C2
+        from ..core import config as C2
 
         if speed is None:
             speed = C2.REPLAY_SPEED

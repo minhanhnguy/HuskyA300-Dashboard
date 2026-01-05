@@ -14,7 +14,7 @@ import {
   CmdStatsResponse,
   PlanResponse,
   GoalResponse,
-} from "./types";
+} from "./types/index";
 
 /**
  * Husky Dashboard — main.ts
@@ -61,6 +61,8 @@ const attackModal = document.getElementById("attackModal") as HTMLDivElement | n
 const attackModalCoords = document.getElementById("attackModalCoords") as HTMLParagraphElement | null;
 const attackConfirmBtn = document.getElementById("attackConfirmBtn") as HTMLButtonElement | null;
 const attackCancelBtn = document.getElementById("attackCancelBtn") as HTMLButtonElement | null;
+const spoofLoadingModal = document.getElementById("spoofLoadingModal") as HTMLDivElement | null;
+const spoofLoadingStatus = document.getElementById("spoofLoadingStatus") as HTMLParagraphElement | null;
 
 // Analysis Panel elements
 // const cmdOverlayToggle = document.getElementById("cmdOverlayToggle") as HTMLButtonElement | null; // Analysis Panel elements
@@ -114,11 +116,14 @@ const zoom = d3
 // Global state
 // ==============================
 let isBagMode = false; // true => freeze live growth; use map_full_at
+let isPlayingSpoofedBag = false; // true => playing a spoofed bag (skip midpoint marker)
 let liveMode = true; // auto-follow end in live mode (ignored in bag mode)
 
 let isPlaying = false; // bag playback
 let playRate = 1.0; // 1×
 let lastTickTs: number | null = null;
+
+let isGeneratingSpoof = false; // true => block all API calls while generating spoof
 
 // Progressive refine timer & state
 let mapPlayTimer: number | null = null; // drives map_delta polling
@@ -165,11 +170,77 @@ let showLidar = true;
 let showPlan = true;
 let showGoal = true;
 
-// 50% path marker
+// 50% path marker (from backend unified calculation)
 let halfwayPoint: { x: number; y: number; reached: boolean } | null = null;
 let halfwayT: { t: number; reached: boolean } | null = null;
 let poseHistDist: Float32Array | null = null;
 let fixedHalfway: { t: number; x: number; y: number } | null = null;
+
+// Backend midpoint data (unified calculation: pose_history + nav_path)
+let backendMidpoint: {
+  t: number;
+  x: number;
+  y: number;
+  yaw: number;
+  pose_history_distance: number;
+  nav_path_distance: number;
+  total_distance: number;
+  midpoint_distance: number;
+} | null = null;
+
+// Fetch midpoint from backend (realistic estimate based on current time)
+async function fetchMidpoint(atTime?: number): Promise<void> {
+  try {
+    // If atTime is provided, request midpoint calculated using only pose history up to that time
+    const url = atTime !== undefined
+      ? `/api/v1/bag/midpoint?t=${atTime}`
+      : "/api/v1/bag/midpoint";
+
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      backendMidpoint = null;
+      fixedHalfway = null;
+      halfwayPoint = null;
+      halfwayT = null;
+      return;
+    }
+    const data = await resp.json();
+    backendMidpoint = {
+      t: data.t,
+      x: data.x,
+      y: data.y,
+      yaw: data.yaw,
+      pose_history_distance: data.pose_history_distance,
+      nav_path_distance: data.nav_path_distance,
+      total_distance: data.total_distance,
+      midpoint_distance: data.midpoint_distance
+    };
+
+    // Update fixedHalfway for compatibility with existing code
+    fixedHalfway = {
+      t: data.t,
+      x: data.x,
+      y: data.y
+    };
+
+    // Update display variables
+    halfwayPoint = {
+      x: data.x,
+      y: data.y,
+      reached: false  // Will be updated based on current timeline position
+    };
+    halfwayT = {
+      t: data.t,
+      reached: false  // Will be updated based on current timeline position
+    };
+
+    console.log(`[Midpoint] Backend: (${data.x.toFixed(2)}, ${data.y.toFixed(2)}) at t=${data.t.toFixed(2)}, histDist=${data.pose_history_distance.toFixed(2)}, navDist=${data.nav_path_distance.toFixed(2)}, total=${data.total_distance.toFixed(2)}`);
+  } catch (e) {
+    console.error("Failed to fetch midpoint:", e);
+    backendMidpoint = null;
+  }
+}
+
 
 // Plan/Goal state
 let planPath: [number, number][] | null = null;
@@ -195,6 +266,8 @@ let fakeDataLog: FakeDataEntry[] = [];  // fake data entries with timestamps
 let originalGoalAtAttack: { x: number; y: number; yaw: number } | null = null;  // goal at attack start
 let storedNavPath: [number, number][] | null = null;  // nav path stored at 50% point
 let fakePathProgress = 0;  // distance traveled along storedNavPath (meters)
+let currentBagName: string | null = null;  // track current bag for spoofing
+let spoofedBagPath: string | null = null;  // path to spoofed bag after generation
 
 // Robot Description (URDF)
 // Default fallback: Husky A300 (0.99m x 0.698m)
@@ -451,6 +524,8 @@ async function waitForStablePoseHistory({
     await sleep(pollMs);
   }
 }
+
+
 
 // ==============================
 // cmd_vel overlay helpers
@@ -1050,6 +1125,7 @@ connectMapWS();
 // ==============================
 async function fetchMapAtRel(rel: number): Promise<void> {
   if (!isBagMode || t0 == null) return;
+  if (isGeneratingSpoof) return; // Block during spoof generation
   const absT = t0 + rel;
   isMapLoading = true;
   try {
@@ -1081,6 +1157,7 @@ async function fetchMapAtRel(rel: number): Promise<void> {
 // Map patches between two absolute times (bag mode)
 async function fetchMapDeltaBetween(absT0: number, absT1: number): Promise<void> {
   if (!isBagMode || t0 == null) return;
+  if (isGeneratingSpoof) return; // Block during spoof generation
   if (!mapLayer) {
     // If we somehow don't have a base, load full at target then return
     const rel = absT1 - t0;
@@ -1144,6 +1221,7 @@ async function fetchMapDeltaBetween(absT0: number, absT1: number): Promise<void>
 async function fetchCostmapsAtRel(rel: number): Promise<void> {
   console.log(`[costmap] fetchAtRel ${rel}, isBag=${isBagMode}, t0=${t0}`);
   if (!isBagMode || t0 == null) return;
+  if (isGeneratingSpoof) return; // Block during spoof generation
   const absT = t0 + rel;
   console.log(`[costmap] fetching for absT=${absT}`);
 
@@ -1204,6 +1282,7 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
 // ==============================
 async function requestScanAtAbs(absT: number): Promise<void> {
   if (!isBagMode || t0 == null) return;
+  if (isGeneratingSpoof) return; // Block during spoof generation
   if (scanReqInFlight) return;
   // if (lastScanReqAbsT != null && Math.abs(absT - lastScanReqAbsT) < 0.03) return; // throttle
 
@@ -1283,8 +1362,10 @@ async function loadBagListIntoPanel(): Promise<void> {
   bagPanelStatus.textContent = "Loading…";
   bagList.innerHTML = "";
   try {
-    const j = (await (await fetch("/api/v1/bag/list")).json()) as { bags?: Array<{ name: string; size: number }> };
-    const bags = j.bags || [];
+    const response = await fetch("/api/v1/bag/list");
+    const j = await response.json();
+    // API returns array directly, not {bags: [...]}
+    const bags = (Array.isArray(j) ? j : j.bags || []) as Array<{ name: string; size: number; spoofed?: boolean }>;
     if (!bags.length) {
       bagPanelStatus.textContent = "No bag files found.";
       return;
@@ -1292,11 +1373,17 @@ async function loadBagListIntoPanel(): Promise<void> {
     bagPanelStatus.textContent = "";
     bags.forEach((b) => {
       const li = document.createElement("li");
-      li.textContent = b.name;
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = b.spoofed ? `🎯 ${b.name}` : b.name;
+      if (b.spoofed) {
+        li.style.background = "#fef3c7";  // Yellow tint for spoofed
+        li.style.borderColor = "#f59e0b";
+      }
+      li.appendChild(nameSpan);
       const size = document.createElement("small");
       size.textContent = `${(b.size / 1024).toFixed(1)} KB`;
       li.appendChild(size);
-      li.onclick = () => startBagReplay(b.name);
+      li.onclick = () => startBagReplay(b.name, b.spoofed || false);
       bagList.appendChild(li);
     });
   } catch {
@@ -1322,14 +1409,14 @@ if (bagPanel)
 // ==============================
 // Start bag (jump to END immediately)
 // ==============================
-async function startBagReplay(name: string): Promise<void> {
+async function startBagReplay(name: string, spoofed: boolean = false): Promise<void> {
   stopPlayback(); // clean playback state
   let resp: Response;
   try {
     resp = await fetch("/api/v1/bag/play", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, spoofed }),
     });
   } catch {
     setStatus("Bag start failed (network)");
@@ -1341,8 +1428,12 @@ async function startBagReplay(name: string): Promise<void> {
     return;
   }
 
+  // Track if we're playing a spoofed bag (to hide midpoint marker)
+  isPlayingSpoofedBag = spoofed;
+
   isBagMode = true;
   liveMode = false;
+  currentBagName = name;  // Save for spoofing
 
   // Hide the small "Live" button and show Play/Pause (if present)
   if (liveBtn) liveBtn.style.display = "none";
@@ -1359,12 +1450,24 @@ async function startBagReplay(name: string): Promise<void> {
   originalGoalAtAttack = null;
   storedNavPath = null;
   fakePathProgress = 0;
+  backendMidpoint = null;
+  fixedHalfway = null;
+  halfwayPoint = null;
+  halfwayT = null;
   if (attackModeBtn) attackModeBtn.classList.remove("active", "confirmed", "fake-data");
 
   path = [];
   scanPoints = null;
   lastScanReqAbsT = null;
   scanReqInFlight = false;
+
+  // Reset navigation state (goal marker and plan path)
+  goalPose = null;
+  planPath = null;
+  planReqInFlight = false;
+  goalReqInFlight = false;
+  lastPlanReqAbsT = null;
+  lastGoalReqAbsT = null;
 
   // reset cmd overlay stats for new bag
   cmdStats = null;
@@ -1393,6 +1496,9 @@ async function startBagReplay(name: string): Promise<void> {
     if (cmdOverlayEnabled) requestCmdStatsAtAbs(absEnd);
   }
 
+  // Fetch midpoint from backend (unified calculation)
+  await fetchMidpoint();
+
   // Fetch robot description (URDF)
   void fetchRobotDescription();
 }
@@ -1413,6 +1519,10 @@ function startPlayback(): void {
   lastTickTs = null;
   if (playBtn) playBtn.textContent = "Pause";
 
+  // IMPORTANT: Clear scrub pose so render uses live getBagPoseAtRel() values
+  scrubPose = null;
+  scrubTime = null;
+
   // Prime lastAbsT for delta
   const relNow = Number(slider!.value) || 0;
   lastAbsTForDelta = (t0 ?? 0) + relNow;
@@ -1429,6 +1539,7 @@ function stopPlayback(): void {
 
 async function playLoop(): Promise<void> {
   if (!isPlaying || !isBagMode || t0 == null) return;
+  if (isGeneratingSpoof) return; // Block during spoof generation
 
   const now = performance.now();
   if (lastTickTs == null) {
@@ -1447,10 +1558,12 @@ async function playLoop(): Promise<void> {
   rel += dt * playRate;
 
   // =========================================
-  // ATTACK MODE: Check for 50% and generate fake data
+  // ATTACK MODE: Check for midpoint and generate fake data
   // =========================================
+  // Use fixedHalfway (the "Midpoint" marker) - this is more realistic because in a real attack
+  // you wouldn't know the exact 50% ahead of time, only an estimate based on current data
   if (attackConfirmed && !attackHalfwayReached && fixedHalfway) {
-    // Check if we've reached the 50% point
+    // Check if we've reached the midpoint
     const currentAbsT = (t0 ?? 0) + rel;
     if (fixedHalfway && currentAbsT >= fixedHalfway.t) {
       attackHalfwayReached = true;
@@ -1462,7 +1575,7 @@ async function playLoop(): Promise<void> {
         fakePathProgress = 0;
       }
 
-      setStatus(`Attack mode: 50% reached. Generating fake location data following nav path.`);
+      setStatus(`Attack mode: Midpoint reached. Generating fake location data following nav path.`);
 
       // Update button
       if (attackModeBtn) {
@@ -1669,6 +1782,8 @@ liveModeBtn.onclick = async () => {
   storedNavPath = null;
   fakePathProgress = 0;
   if (attackModeBtn) attackModeBtn.classList.remove("active", "confirmed", "fake-data");
+
+
 
   scanPoints = null;
   lastScanReqAbsT = null;
@@ -1889,191 +2004,64 @@ setTimeout(async () => {
 
 // ... (loadPoseHistoryOnce remains same)
 
+// Throttling for midpoint refresh
+let lastMidpointFetchTime = 0;
+let midpointFetchInFlight = false;
+const MIDPOINT_REFRESH_INTERVAL_MS = 500; // Refresh every 500ms during playback
+
 function updateHalfwayPoint(currentPose: { x: number; y: number }): void {
-  if (!poseHist.length || t0 == null || !poseHistDist) return;
+  // Dynamic midpoint estimation using backend calculation
+  // The backend calculates based on pose history up to current time + nav path
+
+  if (!t0 || !isBagMode) {
+    return;
+  }
 
   const rel = Number(slider!.value) || 0;
   const absT = t0 + rel;
 
-  // 1. Dynamic Calculation (Always run this)
-  // Prevent premature triggering:
-  // Require a valid plan and min distance
-  if (!planPath || planPath.length === 0) {
-    halfwayPoint = null;
-    halfwayT = null;
-    return;
+  // Throttled periodic refresh of midpoint estimate
+  const now = performance.now();
+  if (!midpointFetchInFlight && now - lastMidpointFetchTime > MIDPOINT_REFRESH_INTERVAL_MS) {
+    lastMidpointFetchTime = now;
+    midpointFetchInFlight = true;
+
+    // Fetch midpoint calculated for current timeline position (realistic estimate)
+    fetchMidpoint(absT).finally(() => {
+      midpointFetchInFlight = false;
+    });
   }
 
-  // 1. Calculate History Distance
-  let idx = 0;
-  while (idx < poseHist.length && poseHist[idx].t <= absT) {
-    idx++;
-  }
-  const lastIdx = Math.max(0, idx - 1);
+  // If we have backend midpoint data, update display
+  if (backendMidpoint) {
+    // Check if we've reached/passed the midpoint 
+    const isPast = absT >= backendMidpoint.t;
 
-  let distHistory = poseHistDist[lastIdx];
-  const dx = currentPose.x - poseHist[lastIdx].x;
-  const dy = currentPose.y - poseHist[lastIdx].y;
-  distHistory += Math.sqrt(dx * dx + dy * dy);
-
-  // 2. Calculate Plan Distance
-  let distPlan = 0;
-  if (planPath && planPath.length > 0) {
-    const dx0 = planPath[0][0] - currentPose.x;
-    const dy0 = planPath[0][1] - currentPose.y;
-    distPlan += Math.sqrt(dx0 * dx0 + dy0 * dy0);
-
-    for (let i = 1; i < planPath.length; i++) {
-      const dx = planPath[i][0] - planPath[i - 1][0];
-      const dy = planPath[i][1] - planPath[i - 1][1];
-      distPlan += Math.sqrt(dx * dx + dy * dy);
-    }
-  }
-
-  // 3. Total Estimated Distance
-  const totalDist = distHistory + distPlan;
-
-  if (totalDist < 1.0) {
-    halfwayPoint = null;
-    halfwayT = null;
-    return;
-  }
-
-  const targetDist = totalDist * 0.5;
-
-  // 4. Determine Reached Status & Calculate Candidate Point
-  let candidatePoint: { x: number, y: number, reached: boolean } | null = null;
-  let candidateT: { t: number, reached: boolean } | null = null;
-  const isReached = targetDist <= distHistory;
-
-  if (isReached) {
-    // It's in history
-    let k = 0;
-    while (k < lastIdx && poseHistDist[k + 1] <= targetDist) {
-      k++;
-    }
-
-    if (k < lastIdx) {
-      const dStart = poseHistDist[k];
-      const dEnd = poseHistDist[k + 1];
-      const ratio = (targetDist - dStart) / (dEnd - dStart);
-      candidatePoint = {
-        x: poseHist[k].x + (poseHist[k + 1].x - poseHist[k].x) * ratio,
-        y: poseHist[k].y + (poseHist[k + 1].y - poseHist[k].y) * ratio,
-        reached: true
-      };
-    } else {
-      const dStart = poseHistDist[lastIdx];
-      const dEnd = distHistory;
-      const ratio = (targetDist - dStart) / Math.max(1e-6, dEnd - dStart);
-      candidatePoint = {
-        x: poseHist[lastIdx].x + (currentPose.x - poseHist[lastIdx].x) * ratio,
-        y: poseHist[lastIdx].y + (currentPose.y - poseHist[lastIdx].y) * ratio,
-        reached: true
-      };
-    }
-
-    // Calculate T for reached point
-    // Search targetDist in FULL poseHistDist
-    let m = 0;
-    if (poseHistDist[poseHistDist.length - 1] < targetDist) {
-      candidateT = null; // Should not happen if reached is true based on current history
-    } else {
-      while (m < poseHistDist.length - 1 && poseHistDist[m + 1] <= targetDist) {
-        m++;
-      }
-      const dStart = poseHistDist[m];
-      const dEnd = poseHistDist[m + 1];
-      const ratio = (targetDist - dStart) / Math.max(1e-6, dEnd - dStart);
-      const tInterp = poseHist[m].t + (poseHist[m + 1].t - poseHist[m].t) * ratio;
-      candidateT = { t: tInterp, reached: true };
-    }
-
-  } else {
-    // It's in plan (Future)
-    let d = distHistory;
-    if (planPath && planPath.length > 0) {
-      const dx0 = planPath[0][0] - currentPose.x;
-      const dy0 = planPath[0][1] - currentPose.y;
-      const segLen0 = Math.sqrt(dx0 * dx0 + dy0 * dy0);
-
-      if (d + segLen0 >= targetDist) {
-        const remain = targetDist - d;
-        const ratio = remain / segLen0;
-        candidatePoint = {
-          x: currentPose.x + dx0 * ratio,
-          y: currentPose.y + dy0 * ratio,
-          reached: false
-        };
-      } else {
-        d += segLen0;
-        let found = false;
-        for (let i = 1; i < planPath.length; i++) {
-          const dx = planPath[i][0] - planPath[i - 1][0];
-          const dy = planPath[i][1] - planPath[i - 1][1];
-          const segLen = Math.sqrt(dx * dx + dy * dy);
-          if (d + segLen >= targetDist) {
-            const remain = targetDist - d;
-            const ratio = remain / segLen;
-            candidatePoint = {
-              x: planPath[i - 1][0] + dx * ratio,
-              y: planPath[i - 1][1] + dy * ratio,
-              reached: false
-            };
-            found = true;
-            break;
-          }
-          d += segLen;
-        }
-        if (!found) candidatePoint = null;
-      }
-    } else {
-      candidatePoint = null;
-    }
-
-    // Future T is unknown/not in bag
-    candidateT = null;
-  }
-
-  // 5. Latch Logic
-  // If we found a reached point and haven't latched yet, latch it.
-  if (!fixedHalfway && candidatePoint && candidatePoint.reached && candidateT && candidateT.reached) {
-    fixedHalfway = {
-      t: candidateT.t,
-      x: candidatePoint.x,
-      y: candidatePoint.y
+    // Update display variables
+    halfwayPoint = {
+      x: backendMidpoint.x,
+      y: backendMidpoint.y,
+      reached: isPast
     };
-  }
 
-  // 6. Hybrid Display Logic
-  // Map Marker:
-  // - If Fixed AND Past Fixed Time: Show Fixed (Blue)
-  // - Else: Show Dynamic (Gray)
-  if (fixedHalfway && absT >= fixedHalfway.t) {
-    halfwayPoint = { x: fixedHalfway.x, y: fixedHalfway.y, reached: true };
-  } else {
-    halfwayPoint = candidatePoint;
-    // Force reached=false if we are showing dynamic (even if candidate says reached,
-    // if we are here it means we are before the fixed time or not fixed yet)
-    if (halfwayPoint) halfwayPoint.reached = false;
-  }
+    halfwayT = {
+      t: backendMidpoint.t,
+      reached: isPast
+    };
 
-  // Timeline Marker:
-  // - If Fixed: Show Fixed Time (Gray/Blue based on current time)
-  // - Else: Show Dynamic Time
-  if (fixedHalfway) {
-    const isPast = absT >= fixedHalfway.t;
-    halfwayT = { t: fixedHalfway.t, reached: isPast };
-  } else {
-    halfwayT = candidateT;
-  }
+    // Latch fixedHalfway for attack mode once we pass the midpoint
+    // This ensures attack triggering uses the midpoint as estimated when we reached it
+    if (isPast && !fixedHalfway) {
+      fixedHalfway = {
+        t: backendMidpoint.t,
+        x: backendMidpoint.x,
+        y: backendMidpoint.y
+      };
+      console.log(`[Midpoint] Latched at t=${backendMidpoint.t.toFixed(2)}, pos=(${backendMidpoint.x.toFixed(2)}, ${backendMidpoint.y.toFixed(2)})`);
+    }
 
-  // 7. Visibility Logic
-  if (halfwayPoint) {
+    // Update timeline marker visibility
     updateTimelineMarker();
-  } else {
-    const marker = document.getElementById("halfwayMarker");
-    if (marker) marker.style.display = "none";
   }
 }
 
@@ -2398,6 +2386,8 @@ function drawAttackTarget(): void {
 
 function drawGoal(): void {
   if (!goalPose) return;
+  // Skip if goal is at origin (0,0) - likely stale/default data
+  if (Math.abs(goalPose.x) < 0.01 && Math.abs(goalPose.y) < 0.01) return;
 
   const [x, y] = world2screen(goalPose.x, goalPose.y);
   const size = Math.max(10, 15 * (zoomTransform.k / 40));
@@ -2526,33 +2516,9 @@ function draw(): void {
     // Calculate dynamic halfway point (History + Plan)
     updateHalfwayPoint(renderPose);
 
-    // Draw 50% marker if available
-    if (isBagMode && halfwayPoint) {
-      const [hx, hy] = world2screen(halfwayPoint.x, halfwayPoint.y);
-      const size = Math.max(6, 8 * (zoomTransform.k / 40));
+    // Midpoint marker removed per user request
 
-      ctx.save();
-      // Color based on reached status
-      const color = halfwayPoint.reached ? "#3b82f6" : "#9ca3af"; // Blue-500 vs Gray-400
-      ctx.fillStyle = color;
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
 
-      // Draw pin/circle
-      ctx.beginPath();
-      ctx.arc(hx, hy, size, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-
-      // Label
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "bold 12px sans-serif";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "bottom";
-      ctx.fillText("Est. 50%", hx, hy - size - 2);
-
-      ctx.restore();
-    }
 
     // Loading shimmer while fetching map snapshot
     if (isMapLoading) {
@@ -2586,10 +2552,9 @@ function screen2world(sx: number, sy: number): { x: number; y: number } {
 }
 
 // Open the attack modal with coordinates
-function openAttackModal(worldX: number, worldY: number): void {
+function openAttackModal(): void {
   if (!attackModal || !attackModalCoords) return;
-  attackTarget = { x: worldX, y: worldY };
-  attackModalCoords.textContent = `Target: (${worldX.toFixed(2)}, ${worldY.toFixed(2)})`;
+  attackModalCoords.textContent = "Generate spoofed bag file? The robot will follow the navigation plan from the 50% point.";
   attackModal.classList.remove("hidden");
 }
 
@@ -2599,32 +2564,165 @@ function closeAttackModal(): void {
   attackModal.classList.add("hidden");
 }
 
-// Confirm the attack target
-function confirmAttack(): void {
-  if (!attackTarget) return;
-
-  attackConfirmed = true;
-  attackModeEnabled = false;
-
-  // Store the current goal for later reference
-  if (goalPose) {
-    originalGoalAtAttack = { ...goalPose };
+// Confirm the attack target - calls backend to generate spoofed bag
+async function confirmAttack(): Promise<void> {
+  if (!currentBagName) {
+    setStatus("Error: No bag file loaded.");
+    closeAttackModal();
+    return;
   }
 
-  // Clear fake data log
-  fakeDataLog = [];
-  attackHalfwayReached = false;
-  attackHalfwayTime = null;
-
-  // Update button state
-  if (attackModeBtn) {
-    attackModeBtn.classList.remove("active");
-    attackModeBtn.classList.add("confirmed");
-    attackModeBtn.textContent = "🎯 Attack Active";
-  }
-
+  // Close attack modal and show loading modal
   closeAttackModal();
-  setStatus(`Attack confirmed at (${attackTarget.x.toFixed(2)}, ${attackTarget.y.toFixed(2)}). Play to begin.`);
+
+  // IMPORTANT: Stop playback and block all API calls while generating spoof
+  stopPlayback();
+  isGeneratingSpoof = true;
+
+  if (spoofLoadingModal) {
+    spoofLoadingModal.classList.remove("hidden");
+  }
+
+  // Animated progress messages
+  const progressSteps = [
+    "Indexing original bag poses...",
+    "Calculating topic publish rates...",
+    "Finding 50% distance point...",
+    "Extracting navigation plan...",
+    "Capturing frozen map state...",
+    "Capturing frozen costmap states...",
+    "Generating fake odometry messages...",
+    "Generating fake TF transforms...",
+    "Writing spoofed bag file...",
+  ];
+  let stepIndex = 0;
+
+  if (spoofLoadingStatus) {
+    spoofLoadingStatus.textContent = progressSteps[0];
+  }
+
+  // Cycle through progress steps every 800ms
+  const progressInterval = setInterval(() => {
+    stepIndex = (stepIndex + 1) % progressSteps.length;
+    if (spoofLoadingStatus) {
+      spoofLoadingStatus.textContent = progressSteps[stepIndex];
+    }
+  }, 800);
+
+  try {
+    // Call backend to generate spoofed bag
+    const resp = await fetch("/api/v1/bag/spoof", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: currentBagName }),
+    });
+
+    // Stop progress animation
+    clearInterval(progressInterval);
+
+    const result = await resp.json() as { ok?: boolean; output_path?: string; error?: string };
+
+    if (!result.ok || !result.output_path) {
+      throw new Error(result.error || "Spoofing failed");
+    }
+
+    spoofedBagPath = result.output_path;
+    if (spoofLoadingStatus) {
+      spoofLoadingStatus.textContent = "Spoofed bag created! Loading...";
+    }
+
+    // Extract the spoofed bag name from the path and load it
+    const spoofedBagName = spoofedBagPath.split("/").pop() || "";
+    console.log(`[SPOOF DEBUG] Spoofed bag path: ${spoofedBagPath}`);
+    console.log(`[SPOOF DEBUG] Spoofed bag name: ${spoofedBagName}`);
+
+
+    // Load the spoofed bag (it's already in spoofed_bags, we need backend to handle it)
+    // IMPORTANT: Clear old pose history AND scrub state first to prevent stale data
+    console.log(`[SPOOF DEBUG] Clearing pose history and scrub state...`);
+    poseHist = [];
+    poseHistDist = null;
+    t0 = null;
+    scrubPose = null;  // FIX: Reset scrub pose to prevent old position from being used
+    scrubTime = null;  // FIX: Reset scrub time as well
+
+    // For now, we'll try to play it directly - the backend needs to support spoofed bag path
+    console.log(`[SPOOF DEBUG] Calling bag/play with spoofed=true...`);
+    const playResp = await fetch("/api/v1/bag/play", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: spoofedBagName, spoofed: true }),
+    });
+
+    const playResult = await playResp.json() as { ok?: boolean; error?: string };
+    console.log(`[SPOOF DEBUG] bag/play result:`, playResult);
+
+    if (!playResult.ok) {
+      // Fallback: inform user to manually load the bag
+      if (spoofLoadingModal) spoofLoadingModal.classList.add("hidden");
+      setStatus(`Spoofed bag created at: ${spoofedBagPath}. Copy to bag_files/ to replay.`);
+
+      // Update button state
+      if (attackModeBtn) {
+        attackModeBtn.classList.remove("active");
+        attackModeBtn.classList.add("fake-data");
+        attackModeBtn.textContent = "✅ Spoofed Bag Ready";
+      }
+      return;
+    }
+
+    // Successfully loaded spoofed bag
+    attackConfirmed = true;
+    attackModeEnabled = false;
+    currentBagName = spoofedBagName;
+
+    // Hide loading modal
+    if (spoofLoadingModal) {
+      spoofLoadingModal.classList.add("hidden");
+    }
+
+    // Update button state
+    if (attackModeBtn) {
+      attackModeBtn.classList.remove("active");
+      attackModeBtn.classList.add("fake-data");
+      attackModeBtn.textContent = "🎯 Playing Spoofed Bag";
+    }
+
+    // Wait for bag to index and start playback
+    console.log(`[SPOOF DEBUG] Waiting for stable pose history (30s timeout)...`);
+    await waitForStablePoseHistory({ timeoutMs: 30000, settleMs: 600, pollMs: 300 });
+    console.log(`[SPOOF DEBUG] Pose history settled. Length: ${poseHist.length}, t0: ${t0}`);
+    setTimelineFromPoseHist();
+    setTimelineToEnd();
+
+    // Re-enable API calls now that spoofed bag is loaded
+    isGeneratingSpoof = false;
+    console.log(`[SPOOF DEBUG] isGeneratingSpoof set to false`);
+
+    // Reload map and costmaps from the spoofed bag
+    if (t0 != null) {
+      const dur = getDuration();
+      console.log(`[SPOOF DEBUG] Loading map at duration: ${dur}`);
+      await fetchMapAtRel(dur);
+      await fetchCostmapsAtRel(dur);
+      console.log(`[SPOOF DEBUG] Map and costmaps loaded`);
+    } else {
+      console.log(`[SPOOF DEBUG] ERROR: t0 is null after pose history!`);
+    }
+
+    setStatus(`Spoofed bag loaded successfully!`);
+
+  } catch (error) {
+    // Stop progress animation on error
+    clearInterval(progressInterval);
+    // Re-enable API calls
+    isGeneratingSpoof = false;
+    // Hide loading modal on error
+    if (spoofLoadingModal) {
+      spoofLoadingModal.classList.add("hidden");
+    }
+    setStatus(`Spoofing error: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 // Cancel the attack
@@ -2669,34 +2767,12 @@ if (attackModeBtn) {
       return;
     }
 
-    // Toggle attack mode selection
-    attackModeEnabled = !attackModeEnabled;
-
-    if (attackModeEnabled) {
-      attackModeBtn.classList.add("active");
-      attackModeBtn.textContent = "🎯 Click Map to Select Target";
-      setStatus("Attack mode: Click on the map to select target location.");
-    } else {
-      attackModeBtn.classList.remove("active");
-      attackModeBtn.textContent = "🎯 Attack Mode";
-      attackTarget = null;
-      setStatus("Attack mode cancelled.");
-    }
+    // Show confirmation modal directly (skip target selection)
+    openAttackModal();
   };
 }
 
-// Canvas click handler for attack target selection
-canvas.addEventListener("click", (ev: MouseEvent) => {
-  if (!isBagMode || !attackModeEnabled) return;
-
-  const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const sx = (ev.clientX - rect.left) * dpr;
-  const sy = (ev.clientY - rect.top) * dpr;
-
-  const world = screen2world(sx, sy);
-  openAttackModal(world.x, world.y);
-});
+// Canvas click handler for attack target selection - REMOVED (attack mode now opens modal directly)
 
 // Modal button handlers
 if (attackConfirmBtn) {

@@ -10,7 +10,7 @@ from tf2_msgs.msg import TFMessage
 from builtin_interfaces.msg import Time as RosTime
 from std_msgs.msg import Header
 
-from ..bag_replay import _StampedSE2, _find_latest_before
+from ..bag.models import StampedSE2 as _StampedSE2
 
 def _get_interpolated_se2(stamps: List[_StampedSE2], t: float) -> Optional[_StampedSE2]:
     if not stamps:

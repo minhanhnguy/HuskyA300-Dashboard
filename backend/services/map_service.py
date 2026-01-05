@@ -7,7 +7,7 @@ from ..models import (
     MapMeta, MapOrigin, MapFullResponse, MapFullAtResponse,
     MapDeltaPatch, MapDeltaReset, MapDeltaResponse
 )
-from .. import config as C
+from ..core import config as C
 
 
 def _meta_to_model(meta_like) -> MapMeta:

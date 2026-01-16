@@ -42,7 +42,7 @@ ros2 bag record \
   $NS/map \
   $NS/map_updates \
   $NS/map_metadata \
-  $NS/slam_toolbox/graph_visualization \
+  $NS/slam_toolboa300_0000x/graph_visualization \
   $NS/slam_toolbox/scan_visualization \
   $NS/slam_toolbox/update \
   $NS/global_costmap/costmap \

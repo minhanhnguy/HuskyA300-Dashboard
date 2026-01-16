@@ -8,6 +8,7 @@ Bag spoofing module.
 import os
 import math
 import time
+import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -101,12 +102,18 @@ def _interpolate_along_path(
     
     return x, y, yaw
 
-
 @dataclass
 class SpoofConfig:
     """Configuration for bag spoofing."""
     namespace: str = "/a300_0000"
     speed: float = 0.5  # m/s - robot travel speed for fake movement
+    # Noise parameters to mimic real sensor noise (based on analysis of real data)
+    # Real data characteristics:
+    # - Std dev: ~0.027 m/s at 50Hz = ~0.0005m position noise per frame
+    # - Autocorrelation (lag-1): 0.74 - noise is correlated, not random
+    # - Average run length: ~5.4 samples in same direction
+    position_noise_std: float = 0.0005  # meters - Gaussian noise std dev for x,y positions
+    noise_autocorr: float = 0.74  # Autocorrelation factor for realistic correlated noise
 
 
 class BagSpoofer:
@@ -115,6 +122,7 @@ class BagSpoofer:
     - Copies all data up to 50% mark
     - After 50%: generates fake TF/odom following the last nav plan
     - Other topics (map, costmaps, etc.) are frozen
+    - Uses REAL noise samples from first 50% to create realistic fake noise
     """
     
     def __init__(self, bag_path: str, config: Optional[SpoofConfig] = None):
@@ -128,6 +136,61 @@ class BagSpoofer:
         self.bag_duration: float = 0.0
         self.topic_rates: Dict[str, float] = {}
         self.last_plan: List[Tuple[float, float]] = []
+        
+        # Real noise samples extracted from first 50% of bag
+        # These are SPEED deviations (in m/s), not position deviations
+        self.speed_noise_pool: List[float] = []
+    
+    def _extract_noise_from_poses(self, poses: List[Tuple[float, float, float, float]], t_50_header: float):
+        """
+        Extract real SPEED noise from the first 50% of poses.
+        
+        This calculates speeds and extracts the deviation from the expected
+        speed to create a pool of real noise samples IN M/S.
+        """
+        if len(poses) < 10:
+            return
+        
+        # Calculate speeds for all poses in first 50%
+        speeds = []
+        dts = []
+        
+        for i in range(1, len(poses)):
+            t, x, y, _ = poses[i]
+            t_prev, x_prev, y_prev, _ = poses[i-1]
+            
+            # Only use first 50% of data
+            if t > t_50_header:
+                break
+            
+            dt = t - t_prev
+            if dt > 0.001:  # Valid time delta
+                dx = x - x_prev
+                dy = y - y_prev
+                speed = math.sqrt(dx*dx + dy*dy) / dt
+                
+                # Only analyze when robot is moving (speed > 0.3 m/s)
+                if speed > 0.3 and speed < 1.0:  # Reasonable moving speeds
+                    speeds.append(speed)
+                    dts.append(dt)
+        
+        if len(speeds) < 10:
+            print(f"[spoof] Warning: insufficient moving samples for noise extraction")
+            return
+        
+        # Calculate expected speed (median of all moving speeds)
+        expected_speed = sorted(speeds)[len(speeds) // 2]
+        
+        # Extract noise as deviation from expected speed (IN M/S)
+        speed_noise = [s - expected_speed for s in speeds]
+        
+        self.speed_noise_pool = speed_noise
+        
+        if speed_noise:
+            import numpy as np
+            print(f"[spoof] Extracted {len(speed_noise)} real SPEED noise samples from first 50%")
+            print(f"[spoof] Expected speed: {expected_speed:.4f} m/s")
+            print(f"[spoof] Speed noise: std={np.std(speed_noise):.4f} m/s, range=[{min(speed_noise):.4f}, {max(speed_noise):.4f}]")
     
     def _index_bag(self):
         """Index the bag to extract poses and calculate topic rates."""
@@ -225,6 +288,12 @@ class BagSpoofer:
         # Calculate 50% timestamp
         t_50_raw = self.bag_t0_raw + (self.bag_duration / 2.0)
         t_50_raw_ns = int(t_50_raw * 1e9)
+        
+        # Calculate 50% mark in header time (simulation time)
+        t_50_header = self.header_t0 + (self.bag_duration / 2.0)
+        
+        # Extract real noise samples from first 50% of poses
+        self._extract_noise_from_poses(self.poses, t_50_header)
         
         # End time: same as original bag end
         t_end_raw = self.bag_t0_raw + self.bag_duration
@@ -437,11 +506,11 @@ class BagSpoofer:
         if not last_plan_before_50:
             # No plan - just freeze
             last_plan_before_50 = [(last_pose_before_50[0], last_pose_before_50[1])]
-        
+
         path_distances, total_path_length = _compute_path_distances(last_plan_before_50)
-        
-        # Find where robot is on the path at 50%
-        initial_travel_offset = 0.0
+
+        # Find the closest waypoint on the path to the robot's current position
+        closest_idx = 0
         min_dist_sq = float('inf')
         for i, (px, py) in enumerate(last_plan_before_50):
             dx = px - last_pose_before_50[0]
@@ -449,12 +518,35 @@ class BagSpoofer:
             dist_sq = dx*dx + dy*dy
             if dist_sq < min_dist_sq:
                 min_dist_sq = dist_sq
-                initial_travel_offset = path_distances[i]
+                closest_idx = i
+
+        closest_dist = math.sqrt(min_dist_sq)
+        robot_pos = (last_pose_before_50[0], last_pose_before_50[1])
+        closest_point = last_plan_before_50[closest_idx]
+
+        print(f"[spoof] Robot actual position: ({robot_pos[0]:.2f}, {robot_pos[1]:.2f})")
+        print(f"[spoof] Closest point on plan: index {closest_idx}/{len(last_plan_before_50)}, pos ({closest_point[0]:.2f}, {closest_point[1]:.2f}), distance {closest_dist:.2f}m")
+
+        # Use the nav plan directly - spoofed robot follows the entire planned path
+        # Start from the BEGINNING of the plan and follow it to the end
+        fake_path = list(last_plan_before_50)  # Use the entire plan
+
+        print(f"[spoof] Spoofed robot will follow the ENTIRE nav plan")
+        print(f"[spoof] Fake path: {len(fake_path)} waypoints")
+        print(f"[spoof] Plan start: ({fake_path[0][0]:.2f}, {fake_path[0][1]:.2f})")
+        print(f"[spoof] Plan end: ({fake_path[-1][0]:.2f}, {fake_path[-1][1]:.2f})")
+
+        # Recompute path distances for the fake path
+        path_distances, total_path_length = _compute_path_distances(fake_path)
+        initial_travel_offset = 0.0  # Start from the beginning of the plan
+
+        # Update the path reference for interpolation
+        last_plan_before_50 = fake_path
         
-        remaining_path_length = max(0.1, total_path_length - initial_travel_offset)
+        remaining_path_length = max(0.1, total_path_length)
         fake_duration = remaining_path_length / self.config.speed
         
-        print(f"[spoof] Initial offset on path: {initial_travel_offset:.2f}m")
+        print(f"[spoof] Created fake path with {len(fake_path)} waypoints starting from robot position")
         print(f"[spoof] Remaining path: {remaining_path_length:.2f}m")
         print(f"[spoof] Fake movement duration: {fake_duration:.1f}s at {self.config.speed}m/s")
         
@@ -493,16 +585,62 @@ class BagSpoofer:
         last_tf_static_time = 0.0  # Track when we last wrote tf_static
         tf_static_interval = 0.5  # Write tf_static every 0.5 seconds
         
+        # Initialize SPEED noise state
+        # We sample directly from the speed noise pool to get real ±0.05 m/s variations
+        noise_pool_index = 0  # Index to sample from noise pool
+        use_real_noise = len(self.speed_noise_pool) > 10
+        current_speed_noise = 0.0  # Current speed noise (smoothed with AR(1))
+        
+        # Track cumulative travel distance (to avoid accumulating noise error)
+        cumulative_travel = initial_travel_offset
+        
+        if use_real_noise:
+            import numpy as np
+            print(f"[spoof] Using REAL SPEED noise: {len(self.speed_noise_pool)} samples in pool")
+            print(f"[spoof] Speed noise will create ±{np.std(self.speed_noise_pool):.3f} m/s variations")
+        else:
+            print(f"[spoof] WARNING: Using synthetic noise (insufficient real samples)")
+            innovation_std = self.config.position_noise_std * math.sqrt(1 - self.config.noise_autocorr ** 2)
+        
+        # Simple constant speed path following - no blending
+        # The fake path already starts from the robot's actual position, so we just follow it at constant speed
+        print(f"[spoof] Using base speed: {self.config.speed} m/s")
+        
         while t < t_end_raw:
             try:
                 t_ns = int(t * 1e9)
-                elapsed = t - t_50_raw
+                elapsed = t - t_50_raw  # Still needed for sim_t calculation
                 
-                # Calculate fake position along path
-                travel_distance = initial_travel_offset + (elapsed * self.config.speed)
+                # Apply SPEED noise to THIS STEP ONLY (not cumulative)
+                # This creates actual speed variations like the real data
+                if use_real_noise:
+                    # Get speed noise sample from real pool (with wraparound)
+                    idx = noise_pool_index % len(self.speed_noise_pool)
+                    speed_noise = self.speed_noise_pool[idx]
+                    noise_pool_index += 1
+                else:
+                    speed_noise = 0.0
+                
+                # Calculate travel distance with base speed (no noise in distance)
+                cumulative_travel += self.config.speed * dt
+                
+                # Check if robot has reached end of path (stopped)
+                total_path_length = path_distances[-1] if path_distances else 0
+                robot_is_moving = cumulative_travel < total_path_length
+                
                 fake_x, fake_y, fake_yaw = _interpolate_along_path(
-                    last_plan_before_50, path_distances, travel_distance
+                    last_plan_before_50, path_distances, cumulative_travel
                 )
+                
+                # Apply speed noise as POSITION noise after interpolation
+                # ONLY apply noise when robot is moving - no noise when stopped
+                if use_real_noise and speed_noise != 0 and robot_is_moving:
+                    # Calculate direction of travel
+                    dx_dir = math.cos(fake_yaw)
+                    dy_dir = math.sin(fake_yaw)
+                    position_noise = speed_noise * dt
+                    fake_x += dx_dir * position_noise
+                    fake_y += dy_dir * position_noise
                 
                 # Calculate simulation time for header
                 # Use last_clock_time as base to ensure continuity
@@ -596,7 +734,8 @@ class BagSpoofer:
                 odom_msg.twist.twist.linear.x = self.config.speed
                 
                 writer.write(f"{ns}/platform/odom/filtered", serialize_message(odom_msg), t_ns)
-                fake_count += 1
+                writer.write(f"{ns}/platform/odom", serialize_message(odom_msg), t_ns)
+                fake_count += 2
                 
                 # Write frozen topics (less frequently - every 0.1s)
                 for topic in frozen_topics:

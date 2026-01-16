@@ -113,7 +113,8 @@ npm run build
 **1. Start the Backend:**
 ```bash
 # Serves API at http://localhost:8000
-uvicorn app:app --host 0.0.0.0 --port 8000
+source /opt/ros/jazzy/setup.bash
+python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000
 ```
 
 **2. Start the Frontend:**

@@ -14,7 +14,9 @@ import {
   CmdStatsResponse,
   PlanResponse,
   GoalResponse,
+  MidpointResponse,
 } from "./types/index";
+import { fetchGlobalCostmapAt, fetchLocalCostmapAt } from "./api/client";
 
 /**
  * Husky Dashboard — main.ts
@@ -1219,17 +1221,16 @@ async function fetchMapDeltaBetween(absT0: number, absT1: number): Promise<void>
 }
 
 async function fetchCostmapsAtRel(rel: number): Promise<void> {
-  console.log(`[costmap] fetchAtRel ${rel}, isBag=${isBagMode}, t0=${t0}`);
+  // console.log(`[costmap] fetchAtRel ${rel}, isBag=${isBagMode}, t0=${t0}`);
   if (!isBagMode || t0 == null) return;
   if (isGeneratingSpoof) return; // Block during spoof generation
   const absT = t0 + rel;
-  console.log(`[costmap] fetching for absT=${absT}`);
+  // console.log(`[costmap] fetching for absT=${absT}`);
 
   // Global
   try {
-    const r = await fetch(`/api/v1/costmap/global/full_at?t=${encodeURIComponent(absT.toFixed(3))}`);
-    if (r.ok) {
-      const j = (await r.json()) as MapFullAtResponse;
+    const j = await fetchGlobalCostmapAt(absT);
+    if (j && j.meta && j.data) {
       const meta = j.meta;
       const version = meta.version ?? 0;
       const needsRebuild =
@@ -1243,9 +1244,6 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
         currentGlobalCostmapVersion = version;
       }
       globalCostmapLayer!.loadFull(Int8Array.from(j.data));
-    } else {
-      // If 404 or empty, maybe clear it?
-      // globalCostmapLayer = null; 
     }
   } catch {
     // ignore
@@ -1253,9 +1251,8 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
 
   // Local
   try {
-    const r = await fetch(`/api/v1/costmap/local/full_at?t=${encodeURIComponent(absT.toFixed(3))}`);
-    if (r.ok) {
-      const j = (await r.json()) as MapFullAtResponse;
+    const j = await fetchLocalCostmapAt(absT);
+    if (j && j.meta && j.data) {
       const meta = j.meta;
       const version = meta.version ?? 0;
       const needsRebuild =
@@ -1269,8 +1266,6 @@ async function fetchCostmapsAtRel(rel: number): Promise<void> {
         currentLocalCostmapVersion = version;
       }
       localCostmapLayer!.loadFull(Int8Array.from(j.data));
-    } else {
-      // localCostmapLayer = null;
     }
   } catch {
     // ignore

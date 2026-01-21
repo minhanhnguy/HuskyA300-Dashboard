@@ -102,6 +102,81 @@ def _interpolate_along_path(
     
     return x, y, yaw
 
+
+def _raytrace_lidar(
+    robot_x: float, robot_y: float, robot_yaw: float,
+    map_grid, map_info,
+    angle_min: float, angle_max: float, angle_increment: float,
+    range_min: float, range_max: float
+) -> list:
+    """
+    Perform ray-tracing to generate fake LiDAR ranges.
+    
+    Args:
+        robot_x, robot_y: Robot position in map frame (meters)
+        robot_yaw: Robot orientation (radians)
+        map_grid: 2D numpy array of map (height x width), values: -1=unknown, 0=free, 100=occupied
+        map_info: MapMetaData with resolution, origin, width, height
+        angle_min, angle_max, angle_increment: Laser scan parameters
+        range_min, range_max: Min/max range in meters
+    
+    Returns:
+        List of ranges (floats)
+    """
+    import numpy as np
+    
+    res = map_info.resolution
+    ox = map_info.origin.position.x
+    oy = map_info.origin.position.y
+    map_h, map_w = map_grid.shape
+    
+    # Calculate number of rays
+    num_rays = int((angle_max - angle_min) / angle_increment) + 1
+    ranges = []
+    
+    # Ray step size (in meters) - smaller = more accurate but slower
+    step = res * 0.5  # Half cell resolution
+    
+    for i in range(num_rays):
+        angle = angle_min + i * angle_increment
+        # Angle in map frame
+        ray_angle = robot_yaw + angle
+        
+        dx = math.cos(ray_angle)
+        dy = math.sin(ray_angle)
+        
+        # March along the ray
+        distance = range_min
+        hit = False
+        
+        while distance < range_max:
+            # Current point along ray
+            px = robot_x + dx * distance
+            py = robot_y + dy * distance
+            
+            # Convert to map cell coordinates
+            col = int((px - ox) / res)
+            row = int((py - oy) / res)
+            
+            # Check bounds
+            if col < 0 or col >= map_w or row < 0 or row >= map_h:
+                # Out of map - treat as max range
+                break
+            
+            # Check occupancy (occupied if >= 65, matching map palette)
+            if map_grid[row, col] >= 65:
+                hit = True
+                break
+            
+            distance += step
+        
+        if hit:
+            ranges.append(distance)
+        else:
+            ranges.append(float('inf'))  # No hit = inf (standard ROS convention)
+    
+    return ranges
+
 @dataclass
 class SpoofConfig:
     """Configuration for bag spoofing."""
@@ -448,6 +523,11 @@ class BagSpoofer:
         TFMessage_t = get_message("tf2_msgs/msg/TFMessage")
         
         PathMsg = get_message("nav_msgs/msg/Path")
+        OccupancyGrid = get_message("nav_msgs/msg/OccupancyGrid")
+        
+        last_local_costmap = None
+        last_lidar_scan = None
+        global_map_msg = None
         
         # Copy messages up to 50%
         msg_count = 0
@@ -455,6 +535,7 @@ class BagSpoofer:
             topic, raw, t_ns = reader.read_next()
             
             if t_ns <= t_50_raw_ns:
+                # print(f"[spoof] Found topic: {topic}") # Uncomment for debug
                 output_topic = topic_remap.get(topic, topic)
                 writer.write(output_topic, raw, t_ns)
                 msg_count += 1
@@ -485,7 +566,41 @@ class BagSpoofer:
                         last_clock_time = msg.clock.sec + msg.clock.nanosec * 1e-9
                     except:
                         pass
+
+                # Track last local costmap for metadata (resolution, size)
+                if topic == f"{ns}/local_costmap/costmap":
+                    try:
+                        last_local_costmap = deserialize_message(raw, OccupancyGrid)
+                    except:
+                        pass
+                
+                # Track global map for dynamic costmap generation
+                if topic == f"{ns}/map":
+                    try:
+                        global_map_msg = deserialize_message(raw, OccupancyGrid)
+                    except:
+                        pass
+                
+                # Track last lidar scan for parameters
+                if topic == f"{ns}/sensors/lidar2d_0/scan":
+                    try:
+                        LaserScan = get_message("sensor_msgs/msg/LaserScan")
+                        last_lidar_scan = deserialize_message(raw, LaserScan)
+                    except:
+                        pass
         
+        # Prepare global map grid if available
+        global_map_grid = None
+        global_map_info = None
+        if global_map_msg:
+            import numpy as np
+            w = global_map_msg.info.width
+            h = global_map_msg.info.height
+            # ROS OccupancyGrid data is row-major (C-style), int8
+            global_map_grid = np.array(global_map_msg.data, dtype=np.int8).reshape((h, w))
+            global_map_info = global_map_msg.info
+            print(f"[spoof] Captured global map: {w}x{h}, res={global_map_info.resolution:.3f}")
+
         # Get last pose at 50%
         if self.poses:
             # Find pose closest to the actual simulation time at the transition
@@ -561,8 +676,8 @@ class BagSpoofer:
             f"{ns}/robot_description",
             f"{ns}/map",
             f"{ns}/global_costmap/costmap",
-            f"{ns}/local_costmap/costmap",
-            f"{ns}/sensors/lidar2d_0/scan",
+            # f"{ns}/local_costmap/costmap",  # Do NOT freeze local costmap - we spoof it!
+            # f"{ns}/sensors/lidar2d_0/scan",  # Do NOT freeze lidar - we spoof it!
             f"{ns}/plan",
             # "/clock",  # Do NOT freeze /clock - let ros2 bag play generate it!
         ]
@@ -601,6 +716,15 @@ class BagSpoofer:
         else:
             print(f"[spoof] WARNING: Using synthetic noise (insufficient real samples)")
             innovation_std = self.config.position_noise_std * math.sqrt(1 - self.config.noise_autocorr ** 2)
+        
+        # Calculate costmap offset if available
+        costmap_offset_x = 0.0
+        costmap_offset_y = 0.0
+        if last_local_costmap and last_pose_before_50:
+            costmap_offset_x = last_local_costmap.info.origin.position.x - last_pose_before_50[0]
+            costmap_offset_y = last_local_costmap.info.origin.position.y - last_pose_before_50[1]
+            print(f"[spoof] Local costmap offset: ({costmap_offset_x:.2f}, {costmap_offset_y:.2f})")
+
         
         # Simple constant speed path following - no blending
         # The fake path already starts from the robot's actual position, so we just follow it at constant speed
@@ -737,6 +861,159 @@ class BagSpoofer:
                 writer.write(f"{ns}/platform/odom", serialize_message(odom_msg), t_ns)
                 fake_count += 2
                 
+                # Generate fake local costmap
+                if last_local_costmap:
+                    import copy
+                    import numpy as np
+                    from scipy.ndimage import distance_transform_edt
+                    
+                    # Create new costmap message
+                    costmap_msg = OccupancyGrid()
+                    costmap_msg.header = copy.deepcopy(last_local_costmap.header)
+                    costmap_msg.header.stamp = _time_to_msg(sim_t)
+                    costmap_msg.info = copy.deepcopy(last_local_costmap.info)
+                    
+                    # 1. Fix Centering: Calculate origin based on dimensions to center on robot
+                    # We want the robot (fake_x, fake_y) to be at the center of the costmap
+                    res = costmap_msg.info.resolution
+                    w_pixels = costmap_msg.info.width
+                    h_pixels = costmap_msg.info.height
+                    
+                    half_w = (w_pixels * res) / 2.0
+                    half_h = (h_pixels * res) / 2.0
+                    
+                    # Calculate target origin (bottom-left)
+                    # Snap to grid resolution to avoid aliasing artifacts
+                    target_x = round((fake_x - half_w) / res) * res
+                    target_y = round((fake_y - half_h) / res) * res
+                    
+                    costmap_msg.info.origin.position.x = target_x
+                    costmap_msg.info.origin.position.y = target_y
+                    
+                    # If we have a global map, slice it!
+                    if global_map_grid is not None:
+                        # Map parameters
+                        gm_res = global_map_info.resolution
+                        gm_w = global_map_info.width
+                        gm_h = global_map_info.height
+                        gm_ox = global_map_info.origin.position.x
+                        gm_oy = global_map_info.origin.position.y
+                        
+                        # Calculate pixel coordinates of the local costmap origin in the global map
+                        start_col = int((target_x - gm_ox) / gm_res)
+                        start_row = int((target_y - gm_oy) / gm_res)
+                        
+                        # Create empty grid (0 = free space, not -1 for inflation to work better)
+                        # We'll fill unknown areas with -1 later if needed, but for inflation 0 is better base
+                        local_grid = np.zeros((h_pixels, w_pixels), dtype=np.int8)
+                        
+                        # Calculate overlap
+                        src_c0 = max(0, start_col)
+                        src_r0 = max(0, start_row)
+                        src_c1 = min(gm_w, start_col + w_pixels)
+                        src_r1 = min(gm_h, start_row + h_pixels)
+                        
+                        dst_c0 = src_c0 - start_col
+                        dst_r0 = src_r0 - start_row
+                        dst_c1 = dst_c0 + (src_c1 - src_c0)
+                        dst_r1 = dst_r0 + (src_r1 - src_r0)
+                        
+                        if src_c1 > src_c0 and src_r1 > src_r0:
+                            # Copy static map data
+                            # Map data: -1 (unknown), 0 (free), 100 (occupied)
+                            # We map -1 to 0 for inflation calculation purposes, then restore if needed
+                            chunk = global_map_grid[src_r0:src_r1, src_c0:src_c1]
+                            local_grid[dst_r0:dst_r1, dst_c0:dst_c1] = chunk
+                        
+                        # 2. Simulate Inflation
+                        # Create binary obstacle mask (occupied = 1, free/unknown = 0)
+                        obstacles = (local_grid == 100)
+                        
+                        # Compute distance to nearest obstacle
+                        # distance_transform_edt computes distance to background (0)
+                        # We want distance FROM obstacles, so we compute EDT on the INVERTED image (free space)
+                        dist_grid = distance_transform_edt(~obstacles)
+                        
+                        # Inflation parameters (approximate standard ROS costmap)
+                        inflation_radius = 0.55  # meters
+                        cost_scaling_factor = 10.0
+                        inscribed_radius = 0.3 # meters (robot radius)
+                        
+                        # Convert distances to meters
+                        dist_meters = dist_grid * res
+                        
+                        # Calculate costs
+                        # Frontend palette expects: 1-98 for blue-to-red gradient, 99 = cyan, 100 = magenta
+                        # Cost = 98 * exp(-cost_scaling_factor * (distance - inscribed_radius))
+                        # This gives high cost (98 = red) near obstacles, low cost (1 = blue) far away
+                        raw_costs = 98.0 * np.exp(-cost_scaling_factor * (dist_meters - inscribed_radius))
+                        
+                        # Clip to valid range 1-98, cast to regular int first then to int8
+                        # (clipping before int8 avoids overflow issues)
+                        costs = np.clip(raw_costs, 1, 98).astype(np.float32)
+                        
+                        # Create final costmap grid (using int16 to avoid overflow, then convert)
+                        final_grid = np.zeros((h_pixels, w_pixels), dtype=np.int16)
+                        
+                        # Apply inflation where within inflation radius
+                        mask_inflation = (dist_meters <= inflation_radius) & (dist_meters > 0)
+                        final_grid[mask_inflation] = costs[mask_inflation].astype(np.int16)
+                        
+                        # Keep original obstacles (100 = magenta in palette)
+                        final_grid[obstacles] = 100
+                        
+                        # Handle unknown space (-1 in original map)
+                        mask_unknown = (local_grid == -1)
+                        final_grid[mask_unknown] = -1
+                        
+                        # Convert to int8 for ROS message (values are already in valid int8 range: -1 to 100)
+                        final_grid_int8 = final_grid.astype(np.int8)
+                        
+                        costmap_msg.data = final_grid_int8.flatten().tolist()
+                        
+                    else:
+                        # Fallback to static copy if no global map
+                        costmap_msg.data = last_local_costmap.data
+                    
+                    writer.write(f"{ns}/local_costmap/costmap", serialize_message(costmap_msg), t_ns)
+                    fake_count += 1
+
+                # Generate fake LiDAR scan
+                if last_lidar_scan and global_map_grid is not None:
+                    import copy
+                    LaserScan = get_message("sensor_msgs/msg/LaserScan")
+                    
+                    # Create new scan message
+                    scan_msg = LaserScan()
+                    scan_msg.header = copy.deepcopy(last_lidar_scan.header)
+                    scan_msg.header.stamp = _time_to_msg(sim_t)
+                    
+                    # Copy scan parameters from original
+                    scan_msg.angle_min = last_lidar_scan.angle_min
+                    scan_msg.angle_max = last_lidar_scan.angle_max
+                    scan_msg.angle_increment = last_lidar_scan.angle_increment
+                    scan_msg.time_increment = last_lidar_scan.time_increment
+                    scan_msg.scan_time = last_lidar_scan.scan_time
+                    scan_msg.range_min = last_lidar_scan.range_min
+                    scan_msg.range_max = last_lidar_scan.range_max
+                    
+                    # Perform ray-tracing
+                    fake_ranges = _raytrace_lidar(
+                        fake_x, fake_y, fake_yaw,
+                        global_map_grid, global_map_info,
+                        float(last_lidar_scan.angle_min),
+                        float(last_lidar_scan.angle_max),
+                        float(last_lidar_scan.angle_increment),
+                        float(last_lidar_scan.range_min),
+                        float(last_lidar_scan.range_max)
+                    )
+                    
+                    scan_msg.ranges = [float(r) for r in fake_ranges]
+                    scan_msg.intensities = []  # Empty intensities (optional field)
+                    
+                    writer.write(f"{ns}/sensors/lidar2d_0/scan", serialize_message(scan_msg), t_ns)
+                    fake_count += 1
+
                 # Write frozen topics (less frequently - every 0.1s)
                 for topic in frozen_topics:
                     if topic == f"{ns}/tf_static":
